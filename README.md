@@ -28,6 +28,17 @@ docs/verification.md   # 検証記録
 
 `scripts/prepare` / `scripts/check` は `zed-word-counter` と同じパターンを踏襲する。
 
+## 必要な環境
+
+- Git（対象コミットの取得に使用）
+- Rust toolchain（`rustup` 推奨。対象Zedの `rust-toolchain.toml` に従って切り替えます）
+- Zed本体のビルドに必要なプラットフォーム依存パッケージ
+- 対象ソースとCargo依存を取得できるネットワーク、十分なディスク容量
+
+`scripts/prepare` が `upstream.toml` のリポジトリから固定コミットを `.checkout/zed` に取得し、
+このリポジトリのパッチを適用します。Zedのプラットフォーム別ビルド要件は、使用するZedの
+上流ドキュメントも確認してください。
+
 ## 設定
 
 `settings.json` の `scratch_buffers_enabled`（既定 `false`）で有効化する。
