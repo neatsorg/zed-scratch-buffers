@@ -1,0 +1,683 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 75a6f1a..a545d40 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -22245,6 +22245,7 @@ dependencies = [
+  "menu",
+  "node_runtime",
+  "parking_lot",
++ "paths",
+  "postage",
+  "pretty_assertions",
+  "project",
+diff --git a/assets/settings/default.json b/assets/settings/default.json
+index 3f1eca5..f4fe45c 100644
+--- a/assets/settings/default.json
++++ b/assets/settings/default.json
+@@ -155,6 +155,10 @@
+   "hover_popover_hiding_delay": 300,
+   // Whether to confirm before quitting Zed.
+   "confirm_quit": false,
++  // Whether a new untitled tab (workspace::NewFile) backs its buffer with an
++  // internal, disposable file so it registers with language servers like any
++  // other file. Saving it always prompts for a real destination.
++  "scratch_buffers_enabled": false,
+   // Whether to restore last closed project when fresh Zed instance is opened
+   // May take 3 values:
+   //  1. All workspaces open during last session
+diff --git a/crates/editor/src/editor.rs b/crates/editor/src/editor.rs
+index 9602d85..8070044 100644
+--- a/crates/editor/src/editor.rs
++++ b/crates/editor/src/editor.rs
+@@ -273,6 +273,7 @@ use workspace::{
+     TabBarSettings, Toast, ViewId, Workspace, WorkspaceId, WorkspaceSettings,
+     item::{ItemBufferKind, ItemHandle, PreviewTabsSettings, SaveOptions},
+     notifications::{DetachAndPromptErr, NotificationId, NotifyResultExt, NotifyTaskExt},
++    scratch_buffers,
+     searchable::SearchEvent,
+ };
+ pub use zed_actions::editor::RevealInFileManager;
+@@ -2957,12 +2958,74 @@ impl Editor {
+         cx: &mut Context<Workspace>,
+     ) -> Task<Result<Entity<Editor>>> {
+         let project = workspace.project().clone();
+-        let create = project.update(cx, |project, cx| project.create_buffer(None, true, cx));
++
++        // 機能は既定オフ。無効なら従来どおりファイルなしのバッファを作る
++        // （LSP には登録されない代わりに、内部の下書きファイルも作らない）。
++        if !WorkspaceSettings::get_global(cx).scratch_buffers_enabled {
++            let create = project.update(cx, |project, cx| project.create_buffer(None, true, cx));
++            return cx.spawn_in(window, async move |workspace, cx| {
++                let buffer = create.await?;
++                buffer.update(cx, |buffer, _| {
++                    buffer.set_content_language_detection_enabled(true);
++                });
++                workspace.update_in(cx, |workspace, window, cx| {
++                    let editor =
++                        cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
++                    workspace.add_item_to_active_pane(
++                        Box::new(editor.clone()),
++                        None,
++                        true,
++                        window,
++                        cx,
++                    );
++                    editor
++                })
++            });
++        }
++
++        let fs = workspace.app_state().fs.clone();
++        // 実ファイルを内部の下書き置き場に作ることで project::File を持つバッファとして
++        // 開く（LSP 登録に必要、register_buffer_with_language_servers 参照）。タブ表示
++        // ではこのパスを scratch_buffers::is_scratch_path で検出し、実パスの代わりに
++        // Untitled-N を出す（crates/editor/src/items.rs 参照）。
++        let (scratch_path, display_number) = scratch_buffers::new_scratch_buffer_path();
+ 
+         cx.spawn_in(window, async move |workspace, cx| {
+-            let buffer = create.await?;
+-            buffer.update(cx, |buffer, _| {
+-                buffer.set_content_language_detection_enabled(true);
++            let create_buffer_file = async {
++                if let Some(parent) = scratch_path.parent() {
++                    fs.create_dir(parent).await?;
++                }
++                fs.create_file(&scratch_path, Default::default()).await
++            }
++            .await;
++            if create_buffer_file.is_err() {
++                scratch_buffers::release_display_number(display_number);
++            }
++            create_buffer_file?;
++
++            let open = project.update(cx, |project, cx| {
++                project.open_local_buffer(scratch_path.clone(), cx)
++            });
++            let buffer = match open.await {
++                Ok(buffer) => buffer,
++                Err(err) => {
++                    scratch_buffers::release_display_number(display_number);
++                    return Err(err);
++                }
++            };
++            buffer.update(cx, |buffer, cx| {
++                // 内容から言語を推測させると Plain Text から変わってしまいうるため、
++                // 下書きは初期言語を Plain Text に固定する（自動判定を無効化）。
++                buffer.set_content_language_detection_enabled(false);
++                // このバッファへの最後の参照（分割ペインでの複数表示を含む）が消えた
++                // ときにのみ表示番号を解放する。docs/design.md「3. 分割ペインで最後の
++                // 表示を閉じた際の扱い」参照。保存によって scratch のパスから外れた
++                // 場合でも、この解放自体は無害（is_scratch_path はもう関係ない番号を
++                // 二重解放するだけで、他の下書きの番号には影響しない）。
++                cx.on_release(move |_buffer, _cx| {
++                    scratch_buffers::release_display_number(display_number);
++                })
++                .detach();
+             });
+             workspace.update_in(cx, |workspace, window, cx| {
+                 let editor =
+@@ -3080,6 +3143,9 @@ impl Editor {
+     }
+ 
+     pub fn title<'a>(&self, cx: &'a App) -> Cow<'a, str> {
++        if let Some(label) = items::scratch_buffer_tab_label(self.buffer(), cx) {
++            return label.to_string().into();
++        }
+         self.buffer().read(cx).title(cx)
+     }
+ 
+diff --git a/crates/editor/src/items.rs b/crates/editor/src/items.rs
+index 163602b..fde55c7 100644
+--- a/crates/editor/src/items.rs
++++ b/crates/editor/src/items.rs
+@@ -57,6 +57,7 @@ use workspace::{
+ use workspace::{
+     Pane, TabBarSettings, WorkspaceSettings,
+     item::{FollowEvent, ProjectItemKind},
++    scratch_buffers,
+     searchable::SearchOptions,
+ };
+ use zed_actions::preview::{
+@@ -684,6 +685,9 @@ impl Item for Editor {
+     }
+ 
+     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
++        if let Some(label) = scratch_buffer_tab_label(&self.buffer, cx) {
++            return Some(label);
++        }
+         let multi_buffer = self.buffer().read(cx);
+         if let Some(file) = multi_buffer
+             .as_singleton()
+@@ -710,6 +714,9 @@ impl Item for Editor {
+     }
+ 
+     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {
++        if let Some(label) = scratch_buffer_tab_label(&self.buffer, cx) {
++            return label;
++        }
+         if let Some(path) = path_for_buffer(&self.buffer, detail, true, cx) {
+             path.to_string().into()
+         } else {
+@@ -719,6 +726,9 @@ impl Item for Editor {
+     }
+ 
+     fn suggested_filename(&self, cx: &App) -> SharedString {
++        if let Some(label) = scratch_buffer_tab_label(&self.buffer, cx) {
++            return format!("{label}.txt").into();
++        }
+         let multi_buffer = self.buffer.read(cx);
+         let title = multi_buffer.title(cx);
+         if let Some(buffer) = multi_buffer.as_singleton() {
+@@ -935,6 +945,14 @@ impl Item for Editor {
+         if self.read_only(cx) {
+             return false;
+         }
++        // A scratch buffer has a real (internal, disposable) file so it can register with
++        // language servers, but a normal Save must still prompt for a real destination
++        // instead of silently overwriting the internal draft file. Reporting can_save =
++        // false routes Pane::save_item to the can_save_as branch instead (see
++        // crates/workspace/src/pane.rs).
++        if scratch_buffer_tab_label(&self.buffer, cx).is_some() {
++            return false;
++        }
+         let buffer = &self.buffer().read(cx);
+         if let Some(buffer) = buffer.as_singleton() {
+             buffer.read(cx).project_path(cx).is_some()
+@@ -2266,6 +2284,22 @@ pub fn entry_git_aware_label_color(git_status: GitSummary, ignored: bool, select
+     }
+ }
+ 
++/// If `buffer` is a singleton backed by a scratch-buffer draft file (see
++/// `workspace::scratch_buffers`), returns its `Untitled-N` display label instead of the
++/// real (internal, disposable) file path. `None` for any other buffer.
++pub(crate) fn scratch_buffer_tab_label(
++    buffer: &Entity<MultiBuffer>,
++    cx: &App,
++) -> Option<SharedString> {
++    let file = buffer.read(cx).as_singleton()?.read(cx).file()?;
++    let abs_path = File::from_dyn(Some(file))?.abs_path(cx);
++    if !scratch_buffers::is_scratch_path(&abs_path) {
++        return None;
++    }
++    let number = scratch_buffers::scratch_display_number(&abs_path)?;
++    Some(format!("Untitled-{number}").into())
++}
++
+ fn path_for_buffer<'a>(
+     buffer: &Entity<MultiBuffer>,
+     height: usize,
+diff --git a/crates/settings/src/vscode_import.rs b/crates/settings/src/vscode_import.rs
+index 997625f..ddb5abd 100644
+--- a/crates/settings/src/vscode_import.rs
++++ b/crates/settings/src/vscode_import.rs
+@@ -1039,6 +1039,7 @@ impl VsCodeSettings {
+         WorkspaceSettingsContent {
+             active_pane_modifiers: self.active_pane_modifiers(),
+             accessible_mode: None,
++            scratch_buffers_enabled: None,
+             text_rendering_mode: None,
+             autosave: self.read_enum("files.autoSave", |s| match s {
+                 "off" => Some(AutosaveSetting::Off),
+diff --git a/crates/settings_content/src/workspace.rs b/crates/settings_content/src/workspace.rs
+index e38b902..0fa5b1c 100644
+--- a/crates/settings_content/src/workspace.rs
++++ b/crates/settings_content/src/workspace.rs
+@@ -37,6 +37,15 @@ pub struct WorkspaceSettingsContent {
+     ///
+     /// Default: false
+     pub confirm_quit: Option<bool>,
++    /// Whether a new untitled tab (`workspace::NewFile`) backs its buffer with an
++    /// internal, disposable file under a scratch-buffers directory instead of a
++    /// fileless buffer. This makes it register with language servers like any other
++    /// file, at the cost of the buffer having (an internal, hidden) location on disk
++    /// from the moment it's created. Saving it always prompts for a real destination,
++    /// same as before.
++    ///
++    /// Default: false
++    pub scratch_buffers_enabled: Option<bool>,
+     /// Whether or not to show the call status icon in the status bar.
+     ///
+     /// Default: true
+diff --git a/crates/workspace/Cargo.toml b/crates/workspace/Cargo.toml
+index 55a47c7..93fb802 100644
+--- a/crates/workspace/Cargo.toml
++++ b/crates/workspace/Cargo.toml
+@@ -50,6 +50,7 @@ menu.workspace = true
+ markdown.workspace = true
+ node_runtime.workspace = true
+ parking_lot.workspace = true
++paths.workspace = true
+ postage.workspace = true
+ project.workspace = true
+ release_channel.workspace = true
+diff --git a/crates/workspace/src/scratch_buffers.rs b/crates/workspace/src/scratch_buffers.rs
+new file mode 100644
+index 0000000..086d07c
+--- /dev/null
++++ b/crates/workspace/src/scratch_buffers.rs
+@@ -0,0 +1,161 @@
++//! 未保存の新規タブ（`Untitled-N` 相当）を、内部的には永続データ領域の `.txt` として
++//! 管理するためのパス生成・判定・表示番号の割り当て。
++//!
++//! LSP へバッファを登録するには実ファイル（`project::File`）が必要なため、実ファイルを
++//! 使う。一方でタブには実パスを見せたくないため、`project::File` 自体には手を入れず、
++//! パスが専用ディレクトリ配下かつ決められたファイル名であることをこのモジュールの
++//! 判定関数（[`is_scratch_path`]）で確認し、呼び出し側（editor クレートのタブ表示）が
++//! その場合だけ `Untitled-N` を表示する。
++
++use std::collections::BTreeSet;
++use std::path::{Path, PathBuf};
++use std::sync::{Mutex, OnceLock};
++
++/// 各下書きの実体ファイル名。番号や UUID をファイル名自体に混ぜず、親ディレクトリ名
++/// （`<display_number>-<uuid>`）だけに寄せることで、判定条件を「専用ディレクトリ配下」
++/// 「ファイル名が一致」の2つに単純化する。
++const SCRATCH_BUFFER_FILE_NAME: &str = "buffer.txt";
++
++/// 下書きを置く専用ディレクトリの名前（`paths::temp_dir()` 配下）。
++const SCRATCH_BUFFERS_DIR_NAME: &str = "scratch-buffers";
++
++/// 下書きを保存する専用ディレクトリ。プロセスの再起動で消えて構わない領域
++/// （`paths::temp_dir()`）配下に置く。あくまでバッファであり、恒久的な保管は求めない
++/// という合意に基づく（docs/design.md 参照）。
++pub fn scratch_root_dir() -> PathBuf {
++    paths::temp_dir().join(SCRATCH_BUFFERS_DIR_NAME)
++}
++
++/// `path` が下書き専用の実体ファイルかどうかを判定する。
++///
++/// 単純な文字列プレフィックス一致ではなく、パスのコンポーネント境界で
++/// [`scratch_root_dir`] 配下にあることと、ファイル名が
++/// [`SCRATCH_BUFFER_FILE_NAME`] と一致することの両方を確認する。これにより、
++/// 偶然似た名前を持つだけの通常のユーザーファイルを誤って下書き扱いしない。
++pub fn is_scratch_path(path: &Path) -> bool {
++    path.file_name().and_then(|name| name.to_str()) == Some(SCRATCH_BUFFER_FILE_NAME)
++        && path.starts_with(scratch_root_dir())
++}
++
++/// `is_scratch_path(path)` が真であることを前提に、パスに埋め込まれた表示番号を返す。
++/// パスの形式は `scratch_root_dir()/<display_number>-<uuid>/buffer.txt`。
++pub fn scratch_display_number(path: &Path) -> Option<usize> {
++    let dir_name = path.parent()?.file_name()?.to_str()?;
++    let (number, _uuid) = dir_name.split_once('-')?;
++    number.parse().ok()
++}
++
++fn active_display_numbers() -> &'static Mutex<BTreeSet<usize>> {
++    static ACTIVE: OnceLock<Mutex<BTreeSet<usize>>> = OnceLock::new();
++    ACTIVE.get_or_init(|| Mutex::new(BTreeSet::new()))
++}
++
++/// 使用中でない最小の表示番号を採番し、使用中として記録する。
++///
++/// 番号はアプリ全体でグローバルに管理する（ウィンドウ単位ではない）。理由は
++/// docs/design.md を参照: ウィンドウ間のタブ移動があっても番号を振り直す必要がなく、
++/// 単一のカウンタで完結するため。
++pub fn allocate_display_number() -> usize {
++    // Even if some earlier panic poisoned this mutex (e.g. a test failing while holding
++    // the guard), the allocator's own invariants don't depend on that panic having left
++    // the set in a torn state (it's a single insert), so recovering here is safe and
++    // keeps later callers from failing for an unrelated reason.
++    let mut numbers = active_display_numbers()
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    let mut candidate = 1;
++    while numbers.contains(&candidate) {
++        candidate += 1;
++    }
++    numbers.insert(candidate);
++    candidate
++}
++
++/// 表示番号を解放し、以後の [`allocate_display_number`] で再利用できるようにする。
++///
++/// 呼び出し側は、そのバッファへの最後の参照（最後の表示）が消えたときにのみこれを
++/// 呼ぶこと。分割ペインで同じ下書きが複数表示されている間は呼んではいけない
++/// （docs/design.md 「3. 分割ペインで最後の表示を閉じた際の扱い」参照）。
++pub fn release_display_number(number: usize) {
++    active_display_numbers()
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++        .remove(&number);
++}
++
++/// `number` が現在採番済み（未解放）かどうかを返す。分割ペインでの解放タイミング
++/// （最後の表示が消えたときにのみ解放されること）を検証する自動テスト向け。
++#[cfg(any(test, feature = "test-support"))]
++pub fn is_display_number_in_use(number: usize) -> bool {
++    active_display_numbers()
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++        .contains(&number)
++}
++
++/// 表示番号はプロセスグローバルな状態なので、特定の番号（`Untitled-1` など）を
++/// 検証する自動テストは、他のテストと同時に番号を採番して混線しないよう、この
++/// ロックで直列化すること。他クレートのテストからも使えるよう、内部実装ではなく
++/// この関数自体が対象。
++///
++/// 通常の `.unwrap()` にしないのは、直列化対象のテストが assert 失敗でこのロックを
++/// 保持したまま panic した場合に、以降の無関係なテストまで連鎖的に失敗させないため。
++#[cfg(any(test, feature = "test-support"))]
++pub fn test_synchronization_lock() -> std::sync::MutexGuard<'static, ()> {
++    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
++    LOCK.get_or_init(|| Mutex::new(()))
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++}
++
++/// 新しい下書きの実体ファイルの絶対パスと表示番号を決める。
++///
++/// ディレクトリ・ファイルの作成はこの関数の呼び出し元（非同期コンテキスト）が行う
++/// ことを想定し、この関数自体はファイルシステムに触れず、パスと番号だけを決める。
++pub fn new_scratch_buffer_path() -> (PathBuf, usize) {
++    let number = allocate_display_number();
++    let uuid = uuid::Uuid::new_v4();
++    let path = scratch_root_dir()
++        .join(format!("{number}-{uuid}"))
++        .join(SCRATCH_BUFFER_FILE_NAME);
++    (path, number)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn scratch_paths_round_trip_their_display_number() {
++        let _guard = test_synchronization_lock();
++        let (path, number) = new_scratch_buffer_path();
++        assert!(is_scratch_path(&path));
++        assert_eq!(scratch_display_number(&path), Some(number));
++        release_display_number(number);
++    }
++
++    #[test]
++    fn ordinary_user_files_are_never_mistaken_for_scratch_buffers() {
++        // 偶然ディレクトリ名の一部に "scratch-buffers" という文字列を含むだけの通常の
++        // ユーザーファイルは、専用ディレクトリの直下ではないので誤判定しない。
++        let lookalike = PathBuf::from("/home/user/notes/my-scratch-buffers-ideas/buffer.txt");
++        assert!(!is_scratch_path(&lookalike));
++
++        // ファイル名が一致しない場合も誤判定しない。
++        let wrong_name = scratch_root_dir().join("1-deadbeef").join("notes.txt");
++        assert!(!is_scratch_path(&wrong_name));
++    }
++
++    #[test]
++    fn released_numbers_are_reused_before_allocating_new_ones() {
++        let _guard = test_synchronization_lock();
++        let first = allocate_display_number();
++        let second = allocate_display_number();
++        assert_ne!(first, second);
++        release_display_number(first);
++        let third = allocate_display_number();
++        assert_eq!(first, third);
++        release_display_number(second);
++        release_display_number(third);
++    }
++}
+diff --git a/crates/workspace/src/workspace.rs b/crates/workspace/src/workspace.rs
+index 70cf387..5466b37 100644
+--- a/crates/workspace/src/workspace.rs
++++ b/crates/workspace/src/workspace.rs
+@@ -15,6 +15,7 @@ pub mod path_list {
+ }
+ pub mod path_link;
+ mod persistence;
++pub mod scratch_buffers;
+ pub mod searchable;
+ pub mod security_modal;
+ pub mod shared_screen;
+diff --git a/crates/workspace/src/workspace_settings.rs b/crates/workspace/src/workspace_settings.rs
+index eff3a0a..19b8367 100644
+--- a/crates/workspace/src/workspace_settings.rs
++++ b/crates/workspace/src/workspace_settings.rs
+@@ -19,6 +19,7 @@ pub struct WorkspaceSettings {
+     pub pane_split_direction_vertical: settings::PaneSplitDirectionVertical,
+     pub centered_layout: settings::CenteredLayoutSettings,
+     pub confirm_quit: bool,
++    pub scratch_buffers_enabled: bool,
+     pub show_call_status_icon: bool,
+     pub autosave: AutosaveSetting,
+     pub restore_on_startup: settings::RestoreOnStartupBehavior,
+@@ -118,6 +119,7 @@ impl Settings for WorkspaceSettings {
+             pane_split_direction_vertical: workspace.pane_split_direction_vertical.unwrap(),
+             centered_layout: workspace.centered_layout.unwrap(),
+             confirm_quit: workspace.confirm_quit.unwrap(),
++            scratch_buffers_enabled: workspace.scratch_buffers_enabled.unwrap(),
+             show_call_status_icon: workspace.show_call_status_icon.unwrap(),
+             autosave: workspace.autosave.unwrap(),
+             restore_on_startup: workspace.restore_on_startup.unwrap(),
+diff --git a/crates/zed/src/zed.rs b/crates/zed/src/zed.rs
+index 2bce5d0..e106b12 100644
+--- a/crates/zed/src/zed.rs
++++ b/crates/zed/src/zed.rs
+@@ -2876,7 +2876,7 @@ mod tests {
+         TestAppContext, UpdateGlobal, VisualTestContext, WindowHandle, actions, point, px,
+     };
+     use http_client::BlockedHttpClient;
+-    use language::LanguageRegistry;
++    use language::{LanguageRegistry, LocalFile};
+     use languages::{markdown_lang, rust_lang};
+     use node_runtime::NodeRuntime;
+     use pretty_assertions::{assert_eq, assert_ne};
+@@ -4483,6 +4483,7 @@ mod tests {
+     #[gpui::test]
+     async fn test_open_and_save_new_file(cx: &mut TestAppContext) {
+         let app_state = init_test(cx);
++        enable_scratch_buffers(cx);
+         app_state
+             .fs
+             .create_dir(Path::new(path!("/root")))
+@@ -4515,7 +4516,11 @@ mod tests {
+             .update(cx, |_, window, cx| {
+                 editor.update(cx, |editor, cx| {
+                     assert!(!editor.is_dirty(cx));
+-                    assert_eq!(editor.title(cx), "untitled");
++                    // The exact number isn't asserted: it's allocated from
++                    // process-global state (workspace::scratch_buffers), so other
++                    // tests running in the same process may have already claimed
++                    // lower numbers.
++                    assert!(editor.title(cx).starts_with("Untitled-"));
+                     assert!(Arc::ptr_eq(
+                         &editor
+                             .buffer()
+@@ -4524,6 +4529,19 @@ mod tests {
+                             .unwrap(),
+                         &languages::PLAIN_TEXT
+                     ));
++                    // The scratch buffer must be backed by a real (internal, disposable)
++                    // file, not a fileless buffer, so it gets registered with language
++                    // servers (see register_buffer_with_language_servers in lsp_store.rs).
++                    assert!(
++                        editor
++                            .buffer()
++                            .read(cx)
++                            .as_singleton()
++                            .unwrap()
++                            .read(cx)
++                            .file()
++                            .is_some()
++                    );
+                     editor.handle_input("hi", window, cx);
+                     assert!(editor.is_dirty(cx));
+                 });
+@@ -4545,7 +4563,11 @@ mod tests {
+         });
+         cx.read(|cx| {
+             assert!(editor.is_dirty(cx));
+-            assert_eq!(editor.read(cx).title(cx), "hi");
++            // Unlike a plain fileless buffer (which would show its content as a title
++            // hint here), a scratch buffer keeps showing Untitled-N until the save
++            // actually completes: it always has a (disposable, internal) file, so the
++            // content-title fallback never applies to it.
++            assert!(editor.read(cx).title(cx).starts_with("Untitled-"));
+         });
+ 
+         // When the save completes, the buffer's title is updated and the language is assigned based
+@@ -4646,9 +4668,147 @@ mod tests {
+         })
+     }
+ 
++    #[gpui::test]
++    async fn test_scratch_buffer_number_released_only_after_last_split_closes(
++        cx: &mut TestAppContext,
++    ) {
++        // docs/design.md "3. 分割ペインで最後の表示を閉じた際の扱い": the display
++        // number of a scratch buffer must stay allocated as long as it's shown in *any*
++        // pane, and only be released once the last such pane closes it.
++        let app_state = init_test(cx);
++        enable_scratch_buffers(cx);
++        let project = Project::test(app_state.fs.clone(), [], cx).await;
++        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
++        let workspace = window
++            .read_with(cx, |mw, _| mw.workspace().clone())
++            .unwrap();
++
++        cx.dispatch_action(window.into(), NewFile);
++        let editor = cx.read(|cx| {
++            workspace
++                .read(cx)
++                .active_item(cx)
++                .unwrap()
++                .downcast::<Editor>()
++                .unwrap()
++        });
++        let number = cx.read(|cx| {
++            let buffer = editor.read(cx).buffer().read(cx).as_singleton().unwrap();
++            let file = buffer.read(cx).file().unwrap();
++            let abs_path = project::File::from_dyn(Some(file)).unwrap().abs_path(cx);
++            workspace::scratch_buffers::scratch_display_number(&abs_path)
++                .expect("new scratch buffer must have a display number")
++        });
++        assert!(workspace::scratch_buffers::is_display_number_in_use(
++            number
++        ));
++
++        // Split the active pane, cloning the same scratch buffer into a second pane.
++        // clone_on_split (via Editor::clone) shares the same MultiBuffer/Buffer entity,
++        // so both panes now display the very same scratch buffer.
++        let original_pane = cx.read(|cx| workspace.read(cx).active_pane().clone());
++        let new_pane = window
++            .update(cx, |_, window, cx| {
++                workspace.update(cx, |workspace, cx| {
++                    workspace.split_and_clone(
++                        original_pane.clone(),
++                        SplitDirection::Right,
++                        window,
++                        cx,
++                    )
++                })
++            })
++            .unwrap()
++            .await
++            .expect("split_and_clone should produce a new pane");
++        let cloned_editor = cx.read(|cx| {
++            new_pane
++                .read(cx)
++                .active_item()
++                .unwrap()
++                .downcast::<Editor>()
++                .unwrap()
++        });
++        cx.read(|cx| {
++            assert_eq!(
++                cloned_editor
++                    .read(cx)
++                    .buffer()
++                    .read(cx)
++                    .as_singleton()
++                    .unwrap(),
++                editor.read(cx).buffer().read(cx).as_singleton().unwrap(),
++                "the split pane must show the same buffer entity, not a copy"
++            );
++        });
++        let weak_cloned_editor = cloned_editor.downgrade();
++        drop(cloned_editor);
++
++        // Closing the item in the original pane must NOT release the number yet: the
++        // scratch buffer is still displayed in new_pane.
++        window
++            .update(cx, |_, window, cx| {
++                original_pane.update(cx, |pane, cx| {
++                    pane.close_active_item(&workspace::pane::CloseActiveItem::default(), window, cx)
++                })
++            })
++            .unwrap()
++            .await
++            .unwrap();
++        cx.run_until_parked();
++        assert!(
++            workspace::scratch_buffers::is_display_number_in_use(number),
++            "number must stay allocated while the scratch buffer is still shown in another pane"
++        );
++
++        let weak_buffer = cx.read(|cx| {
++            editor
++                .read(cx)
++                .buffer()
++                .read(cx)
++                .as_singleton()
++                .unwrap()
++                .downgrade()
++        });
++        // The test itself must not keep the last strong reference to the editor: in the
++        // real app, closing a pane's only tab drops the sole reference to that Editor
++        // (and thus its buffer). Holding `editor` here would keep the buffer alive
++        // regardless of what the pane does, defeating the point of this test.
++        drop(editor);
++
++        // Closing the item in the last remaining pane must release the number.
++        window
++            .update(cx, |_, window, cx| {
++                new_pane.update(cx, |pane, cx| {
++                    pane.close_active_item(&workspace::pane::CloseActiveItem::default(), window, cx)
++                })
++            })
++            .unwrap()
++            .await
++            .unwrap();
++        cx.run_until_parked();
++        // Closing an item enqueues it on Workspace's session-serialization channel
++        // (added_to_pane -> enqueue_item_serialization), which holds a strong Entity
++        // handle until the throttled background task drains it. Advance past that
++        // throttle so the handle is actually dropped before checking for leaks/release.
++        cx.executor().advance_clock(SERIALIZATION_THROTTLE_TIME);
++        cx.run_until_parked();
++        // gpui retains a just-dropped entity's resources until the end of the current
++        // effect cycle; one more empty update flushes that.
++        cx.update(|_| {});
++        cx.run_until_parked();
++        weak_cloned_editor.assert_released();
++        weak_buffer.assert_released();
++        assert!(
++            !workspace::scratch_buffers::is_display_number_in_use(number),
++            "number must be released once the last pane showing the scratch buffer is closed"
++        );
++    }
++
+     #[gpui::test]
+     async fn test_setting_language_when_saving_as_single_file_worktree(cx: &mut TestAppContext) {
+         let app_state = init_test(cx);
++        enable_scratch_buffers(cx);
+         app_state.fs.create_dir(Path::new("/root")).await.unwrap();
+ 
+         let project = Project::test(app_state.fs.clone(), [], cx).await;
+@@ -6144,6 +6304,16 @@ mod tests {
+         });
+     }
+ 
++    fn enable_scratch_buffers(cx: &mut TestAppContext) {
++        cx.update(|cx| {
++            cx.update_global::<SettingsStore, _>(|store, cx| {
++                store.update_user_settings(cx, |settings| {
++                    settings.workspace.scratch_buffers_enabled = Some(true);
++                });
++            });
++        });
++    }
++
+     fn init_test_with_state(
+         cx: &mut TestAppContext,
+         mut app_state: Arc<AppState>,

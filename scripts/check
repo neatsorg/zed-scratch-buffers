@@ -13,14 +13,10 @@ set -euo pipefail
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 checkout_dir="$root_dir/.checkout/zed"
 
-# TODO: fill in once the patch lands on a specific crate (or crates), mirroring
-# zed-word-counter/scripts/check's `-p go_to_line`. Until then this script
-# refuses to run rather than silently checking nothing.
-PACKAGE="${SCRATCH_BUFFERS_CARGO_PACKAGE:-}"
-if [[ -z "$PACKAGE" ]]; then
-    echo "error: set SCRATCH_BUFFERS_CARGO_PACKAGE to the crate(s) this patch touches" >&2
-    exit 1
-fi
+# The patch touches workspace::scratch_buffers plus editor's use of it
+# (new-tab creation, tab display, save routing). Override via
+# SCRATCH_BUFFERS_CARGO_PACKAGES (space-separated) if that changes.
+read -ra packages <<< "${SCRATCH_BUFFERS_CARGO_PACKAGES:-editor workspace}"
 
 if [[ ! -d "$checkout_dir/.git" ]]; then
     echo "error: $checkout_dir not found; run scripts/prepare first." >&2
@@ -29,5 +25,9 @@ fi
 
 cd "$checkout_dir"
 unset CARGO_TARGET_DIR
-cargo check -p "$PACKAGE"
-cargo test -p "$PACKAGE" --lib
+package_args=()
+for package in "${packages[@]}"; do
+    package_args+=(-p "$package")
+done
+cargo check "${package_args[@]}"
+cargo test "${package_args[@]}" --lib

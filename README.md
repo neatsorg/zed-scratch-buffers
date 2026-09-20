@@ -25,6 +25,21 @@ docs/verification.md   # 検証記録
 
 `scripts/prepare` / `scripts/check` は `zed-word-counter` と同じパターンを踏襲する。
 
+## 設定
+
+`settings.json` の `workspace.scratch_buffers_enabled`（既定 `false`）で有効化する。
+
+```json
+{
+  "workspace": {
+    "scratch_buffers_enabled": true
+  }
+}
+```
+
 ## 現状
 
-方針の記録のみ。パッチ本体の実装はまだ着手していない。
+パッチ本体（第一版）を実装し、`editor`・`workspace` クレート単体のテスト、
+`zed` クレートでの統合テスト（新規タブ作成・LSP登録・保存フロー・分割ペインでの
+番号解放）で検証済み。詳細は [`docs/verification.md`](docs/verification.md) を参照。
+`zed-personal-build` 側での統合ビルド・GUI確認は未実施。
