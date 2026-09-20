@@ -1,1 +1,8 @@
 /.checkout/
+
+# エディタ・OS由来の一時ファイル
+*.bak
+*.orig
+*~
+*.swp
+.DS_Store
