@@ -48,3 +48,9 @@ docs/verification.md   # 検証記録
 `zed` クレートでの統合テスト（新規タブ作成・LSP登録・保存フロー・分割ペインでの
 番号解放）で検証済み。詳細は [`docs/verification.md`](docs/verification.md) を参照。
 `zed-personal-build` 側での統合ビルド・GUI確認は未実施。
+
+## ライセンスと公開範囲
+
+このリポジトリのパッチ、スクリプト、文書は GPL-3.0-or-later です。[LICENSE](LICENSE)
+と [NOTICE](NOTICE) を参照してください。これはZed公式配布物ではありません。
+パッチ適用済みバイナリの配布には、対応する変更済みZedソースと第三者ライセンス表示が必要です。

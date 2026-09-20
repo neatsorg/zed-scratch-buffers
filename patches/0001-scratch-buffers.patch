@@ -608,7 +608,7 @@ index 0000000..ccfb38e
 +    fn ordinary_user_files_are_never_mistaken_for_scratch_buffers() {
 +        // 偶然ディレクトリ名の一部に "scratch-buffers" という文字列を含むだけの通常の
 +        // ユーザーファイルは、専用ディレクトリの直下ではないので誤判定しない。
-+        let lookalike = PathBuf::from("/home/user/notes/my-scratch-buffers-ideas/buffer.txt");
++        let lookalike = PathBuf::from("/tmp/notes/my-scratch-buffers-ideas/buffer.txt");
 +        assert!(!is_scratch_path(&lookalike));
 +
 +        // ファイル名が一致しない場合も誤判定しない。

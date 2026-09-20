@@ -1,0 +1,6 @@
+Local patch, scripts, and documentation: Copyright (C) 2026 Sayawaka.
+SPDX-License-Identifier: GPL-3.0-or-later
+
+This repository contains a patch for Zed v1.20.2 at
+7c451e694f3c52ee0aeb01d7e28b5fa18cd0ad2f. It is not an official Zed release.
+Zed-derived code retains its upstream copyright and license notices.
