@@ -9,9 +9,7 @@
 利用できるようにする。表示上はタブ名に `.txt` を出さず、`Untitled-1` / 日本語化時は
 「無題-1」のまま扱う。
 
-背景・調査の詳細は
-[`../zed-writing-tools/docs/scratch-buffer-research.md`](../zed-writing-tools/docs/scratch-buffer-research.md)
-を参照。Zed の LSP 実装は、一度もディスクに紐づいていないバッファを言語サーバーへ
+背景・調査の詳細は分離前の開発資料で整理した。Zed の LSP 実装は、一度もディスクに紐づいていないバッファを言語サーバーへ
 登録しない（`register_buffer_with_language_servers`）ため、通常の Wasm 拡張だけでは
 実現できず、本体パッチが必要という結論に基づく。
 
