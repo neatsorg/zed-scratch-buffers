@@ -272,3 +272,33 @@ enable_scratch_buffers(cx);` で束縛）、scratch buffers を有効化する4�
   （統合検証項目、上記「3. i18n 未対応」参照）。
 - 起動時の古い scratch エントリのクリーンアップ（今回は見送り、
   docs/design.md 確定事項2参照）。
+
+## 2026-09-20: レビュー再確認（1件）
+
+前回のレビュー対応後、再レビューで1件の指摘を受けた。
+
+### `reserve_scratch_buffer_number_if_applicable` が `is_scratch_path` を経由していない
+
+`scratch_display_number(path)` は親ディレクトリ名の形式
+（`<number>-<uuid>`、UUID の妥当性含む）しか確認せず、`scratch_root_dir()` 配下に
+あるかどうかは見ていない。この判定は `is_scratch_path` にしか含まれていないが、
+`crates/editor/src/editor.rs` の `reserve_scratch_buffer_number_if_applicable` は
+`scratch_display_number` だけを呼び、`is_scratch_path` を経由していなかった。
+そのため、`scratch_root_dir()` の外にある、たまたま同じ命名パターン
+（`<number>-<uuid>/buffer.txt`）を持つだけの通常のユーザーファイルを開くと、
+表示上は壊れない（タブ表示側は `is_scratch_path` を正しく使っている）ものの、
+番号だけを消費してしまうことをコードで確認した。
+
+対処: `is_scratch_path(&abs_path)` のチェックを `scratch_display_number` の前に
+追加した。修正の妥当性を検証するため、一時的にこのチェックを外して新規テスト
+`test_opening_lookalike_file_does_not_reserve_a_scratch_number` を実行し、
+確かに失敗すること（バグを検出できること）を確認してから、チェックを復元した。
+
+`git diff --cached --check` と `git apply --check --whitespace=error`
+（クリーンな `7c451e694f3c52ee0aeb01d7e28b5fa18cd0ad2f` に対して）の両方で
+trailing whitespace が無いことを確認した。
+
+editor 1011件・workspace 274件・zed --bin zed 95件（新規1件含む、3回連続実行で
+対象テストは一度も失敗せず、既存の無関係な flaky テストのみ発生）すべて成功。
+パッチを再生成し、クリーンな `7c451e694f3c52ee0aeb01d7e28b5fa18cd0ad2f` への
+単独適用・`scripts/check` の成功を再確認した。

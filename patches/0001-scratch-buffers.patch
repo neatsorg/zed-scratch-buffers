@@ -34,7 +34,7 @@ index 3f1eca5..f4fe45c 100644
    // May take 3 values:
    //  1. All workspaces open during last session
 diff --git a/crates/editor/src/editor.rs b/crates/editor/src/editor.rs
-index 9602d85..b0d3c4d 100644
+index 9602d85..08e9be4 100644
 --- a/crates/editor/src/editor.rs
 +++ b/crates/editor/src/editor.rs
 @@ -210,9 +210,9 @@ use parking_lot::Mutex;
@@ -66,7 +66,7 @@ index 9602d85..b0d3c4d 100644
              }
              editor.report_editor_event(ReportEditorEvent::EditorOpened, None, cx);
          }
-@@ -2705,6 +2707,77 @@ impl Editor {
+@@ -2705,6 +2707,84 @@ impl Editor {
          editor
      }
  
@@ -96,6 +96,13 @@ index 9602d85..b0d3c4d 100644
 +            return;
 +        };
 +        let abs_path = project_file.abs_path(cx);
++        // is_scratch_path で専用ディレクトリ配下であることまで確認してから番号を
++        // 読む。scratch_display_number 単体は親ディレクトリ名の形式（<number>-<uuid>）
++        // しか見ないため、これを省くと scratch_root_dir() の外にある、たまたま同じ
++        // 命名規則を持つだけの通常のユーザーファイルからも番号予約が発生しうる。
++        if !workspace::scratch_buffers::is_scratch_path(&abs_path) {
++            return;
++        }
 +        let Some(number) = workspace::scratch_buffers::scratch_display_number(&abs_path) else {
 +            return;
 +        };
@@ -144,7 +151,7 @@ index 9602d85..b0d3c4d 100644
      pub fn display_snapshot(&self, cx: &mut App) -> DisplaySnapshot {
          self.display_map.update(cx, |map, cx| map.snapshot(cx))
      }
-@@ -2957,13 +3030,71 @@ impl Editor {
+@@ -2957,13 +3037,71 @@ impl Editor {
          cx: &mut Context<Workspace>,
      ) -> Task<Result<Entity<Editor>>> {
          let project = workspace.project().clone();
@@ -219,7 +226,7 @@ index 9602d85..b0d3c4d 100644
              workspace.update_in(cx, |workspace, window, cx| {
                  let editor =
                      cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
-@@ -3080,6 +3211,9 @@ impl Editor {
+@@ -3080,6 +3218,9 @@ impl Editor {
      }
  
      pub fn title<'a>(&self, cx: &'a App) -> Cow<'a, str> {
@@ -229,7 +236,7 @@ index 9602d85..b0d3c4d 100644
          self.buffer().read(cx).title(cx)
      }
  
-@@ -10091,6 +10225,7 @@ impl Editor {
+@@ -10091,6 +10232,7 @@ impl Editor {
              multi_buffer::Event::FileHandleChanged => {
                  cx.emit(EditorEvent::TitleChanged);
                  cx.emit(EditorEvent::FileHandleChanged);
@@ -715,7 +722,7 @@ index eff3a0a..19b8367 100644
              autosave: workspace.autosave.unwrap(),
              restore_on_startup: workspace.restore_on_startup.unwrap(),
 diff --git a/crates/zed/src/zed.rs b/crates/zed/src/zed.rs
-index 2bce5d0..7365d96 100644
+index 2bce5d0..777d047 100644
 --- a/crates/zed/src/zed.rs
 +++ b/crates/zed/src/zed.rs
 @@ -2876,7 +2876,7 @@ mod tests {
@@ -806,7 +813,7 @@ index 2bce5d0..7365d96 100644
          window
              .update(cx, |_, _, cx| {
                  editor.update(cx, |editor, cx| {
-@@ -4646,9 +4683,259 @@ mod tests {
+@@ -4646,9 +4683,332 @@ mod tests {
          })
      }
  
@@ -1059,6 +1066,79 @@ index 2bce5d0..7365d96 100644
 +        );
 +    }
 +
++    #[gpui::test]
++    async fn test_opening_lookalike_file_does_not_reserve_a_scratch_number(
++        cx: &mut TestAppContext,
++    ) {
++        // レビュー指摘: reserve_scratch_buffer_number_if_applicable が
++        // is_scratch_path（scratch_root_dir() 配下であることの確認）を経由せず
++        // scratch_display_number だけを呼んでいると、scratch_root_dir() の外に
++        // ある、たまたま <number>-<uuid> という命名パターンのディレクトリを
++        // 持つだけの通常のユーザーファイルを開いても番号を消費してしまう。
++        let app_state = init_test(cx);
++        let _scratch_buffers_lock = enable_scratch_buffers(cx);
++
++        // Reserve-then-release a number so the directory name below uses one we
++        // know was free immediately before the test, rather than a hardcoded
++        // literal that some other (already-serialized) test might still hold.
++        let number = workspace::scratch_buffers::allocate_display_number();
++        workspace::scratch_buffers::release_display_number(number);
++
++        let lookalike_dir_name = format!("{number}-{}", uuid::Uuid::new_v4());
++        app_state
++            .fs
++            .as_fake()
++            .insert_tree(
++                path!("/root"),
++                json!({
++                    lookalike_dir_name.clone(): {
++                        "buffer.txt": "an ordinary file, not a scratch buffer",
++                    },
++                }),
++            )
++            .await;
++
++        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
++        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
++        let workspace = window
++            .read_with(cx, |mw, _| mw.workspace().clone())
++            .unwrap();
++        let worktree_id = cx.read(|cx| {
++            workspace
++                .read(cx)
++                .worktrees(cx)
++                .next()
++                .unwrap()
++                .read(cx)
++                .id()
++        });
++
++        window
++            .update(cx, |_, window, cx| {
++                workspace.update(cx, |workspace, cx| {
++                    workspace.open_path(
++                        (
++                            worktree_id,
++                            rel_path(&format!("{lookalike_dir_name}/buffer.txt")),
++                        ),
++                        None,
++                        true,
++                        window,
++                        cx,
++                    )
++                })
++            })
++            .unwrap()
++            .await
++            .unwrap();
++        cx.run_until_parked();
++
++        assert!(
++            !workspace::scratch_buffers::is_display_number_in_use(number),
++            "opening a look-alike file outside scratch_root_dir must not reserve a scratch number"
++        );
++    }
++
      #[gpui::test]
      async fn test_setting_language_when_saving_as_single_file_worktree(cx: &mut TestAppContext) {
          let app_state = init_test(cx);
@@ -1066,7 +1146,7 @@ index 2bce5d0..7365d96 100644
          app_state.fs.create_dir(Path::new("/root")).await.unwrap();
  
          let project = Project::test(app_state.fs.clone(), [], cx).await;
-@@ -6144,6 +6431,23 @@ mod tests {
+@@ -6144,6 +6504,23 @@ mod tests {
          });
      }
  
