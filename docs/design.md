@@ -155,13 +155,38 @@ Zed は未知のプロパティとして黙って無視する（パースエラ�
 対応する（どちらを選ぶかは統合側の設計判断）。zed-scratch-buffers 単体としての
 受け入れ条件には含めない。
 
-**方針決定（2026-09-20、[redacted-host] 実機での統合ビルド確認後）**: 「Untitled」という
-表記自体は英語圏の伝統的な言い回しとして馴染みがあり、日本語 UI の中でも
-あえて翻訳せず英語のまま残すことを選んだ。したがって `compat/` での置き換え
-パッチや翻訳接続フックは、優先度低めの任意対応として保留する（気が向いたら
-着手する程度で、統合ビルドの受け入れ条件には含めない）。
+**方針決定（2026-09-20、[redacted-host] 実機での統合ビルド確認・EmEditor 日本語版の
+表記を踏まえて再検討）**: 当初は「Untitled」という表記を英語のまま残す案も
+検討したが、EmEditor 日本語版が「無題-1」のように翻訳している前例を踏まえ、
+翻訳する方針に決定した。
+
+実装方式は **`compat/` での置き換えパッチ**（zed-personal-build 側）を選ぶ。
+理由:
+- `localization::` クレートは i18n 統合後にしか存在しないため、
+  scratch_buffers 側（`crates/workspace/src/scratch_buffers.rs`・
+  `crates/editor/src/items.rs`）に直接 `localization::` 呼び出しを
+  埋め込むと、vanilla Zed への単独適用・単体テストというこのパッチの
+  前提（zed-scratch-buffers 単体で `cargo check`/`cargo test` が通る）が
+  崩れる。
+- zed-i18n 側の `apply_universal.py` を調べたところ、`format!(...)` を
+  伴う動的なメッセージ（今回の `Untitled-{number}` と同種）は、
+  完全自動の AST 抽出ではなく手書きの個別置き換えテーブルで対応されている。
+  つまり「フック」を用意しても結局どこかに手書きのルールが要る点は
+  compat/ 置き換えパッチと変わらない。
+- `docs/repository-separation-plan.md` に、翻訳がパッチの前提と衝突する
+  場合は `zed-personal-build/compat/` に組み合わせ専用の調整を置くと
+  明記されており、これがまさにこのケースにあたる。
+
+zed-scratch-buffers 側の実装（`format!("Untitled-{number}")`）は変更しない。
+compat/ 側のパッチは、i18n の `generate-runtime-bundles`/`apply-universal`
+適用後のチェックアウトに対して、この文字列を `localization::format_message`
+経由の呼び出しへ置き換える形で実装する（未着手、次フェーズ）。
 
 ## 未確定・今後詰める点
 
-（2026-09-20 時点で残っているものはなし。実装済みの内容は
+- **`Untitled-N` の日本語化**: 確定事項7参照。zed-personal-build の
+  `compat/` に置き換えパッチを実装する（未着手）。zed-scratch-buffers
+  自体には変更不要。
+
+（上記以外、2026-09-20 時点で残っているものはなし。実装済みの内容は
 [`../docs/verification.md`](verification.md) を参照。）
