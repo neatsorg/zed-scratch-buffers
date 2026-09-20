@@ -267,7 +267,7 @@ enable_scratch_buffers(cx);` で束縛）、scratch buffers を有効化する4�
   `apply-universal` 後のチェックアウトへの適用検証、統合ビルド、GUI 起動・動作確認は未実施。
 - `docs/scratch-buffer-research.md` にある「保存済みファイルの未保存の編集」と
   「一度も保存していない新規タブ」の区別が、この実装によって解消されたことの
-  実機（[redacted-host]）確認。
+  実機確認。
 - i18n 側で `format!("Untitled-{number}")` が抽出・翻訳可能かの確認
   （統合検証項目、上記「3. i18n 未対応」参照）。
 - 起動時の古い scratch エントリのクリーンアップ（今回は見送り、

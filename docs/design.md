@@ -155,7 +155,7 @@ Zed は未知のプロパティとして黙って無視する（パースエラ�
 対応する（どちらを選ぶかは統合側の設計判断）。zed-scratch-buffers 単体としての
 受け入れ条件には含めない。
 
-**方針決定（2026-09-20、[redacted-host] 実機での統合ビルド確認・EmEditor 日本語版の
+**方針決定（2026-09-20、実機での統合ビルド確認・EmEditor 日本語版の
 表記を踏まえて再検討）**: 当初は「Untitled」という表記を英語のまま残す案も
 検討したが、EmEditor 日本語版が「無題-1」のように翻訳している前例を踏まえ、
 翻訳する方針に決定した。
@@ -180,14 +180,13 @@ Zed は未知のプロパティとして黙って無視する（パースエラ�
 zed-scratch-buffers 側の実装（`format!("Untitled-{number}")`）は変更しない。
 compat/ 側のパッチは、i18n の `generate-runtime-bundles`/`apply-universal`
 適用後のチェックアウトに対して、この文字列を `localization::format_message`
-経由の呼び出しへ置き換える形で実装する（未着手、次フェーズ）。
+経由の呼び出しへ置き換える形で実装済み（2026-09-20、統合ビルド・実機の
+GUI 確認まで完了）。
 
 ## 未確定・今後詰める点
 
-- **`Untitled-N` の日本語化**: 確定事項7参照。zed-personal-build の
-  `compat/scratch-buffers-i18n/` に実装済み（2026-09-20、型検査まで確認、
-  統合ビルド・[redacted-host] 実機での GUI 確認は未実施）。zed-scratch-buffers
-  自体には変更なし。
+（2026-09-20 時点で残っているものはなし。実装済みの内容は
+[`../docs/verification.md`](verification.md) を参照。）
 
 （上記以外、2026-09-20 時点で残っているものはなし。実装済みの内容は
 [`../docs/verification.md`](verification.md) を参照。）
