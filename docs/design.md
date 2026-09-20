@@ -185,8 +185,9 @@ compat/ 側のパッチは、i18n の `generate-runtime-bundles`/`apply-universa
 ## 未確定・今後詰める点
 
 - **`Untitled-N` の日本語化**: 確定事項7参照。zed-personal-build の
-  `compat/` に置き換えパッチを実装する（未着手）。zed-scratch-buffers
-  自体には変更不要。
+  `compat/scratch-buffers-i18n/` に実装済み（2026-09-20、型検査まで確認、
+  統合ビルド・[redacted-host] 実機での GUI 確認は未実施）。zed-scratch-buffers
+  自体には変更なし。
 
 （上記以外、2026-09-20 時点で残っているものはなし。実装済みの内容は
 [`../docs/verification.md`](verification.md) を参照。）
