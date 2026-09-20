@@ -11,9 +11,8 @@ Zed 本体（Rust/GPUI）向けの独立パッチ。一度も保存していな�
 合意事項）。日本語化時の「無題-1」表示は、i18n 側（zed-personal-build 統合時）の
 翻訳接続で対応する統合検証項目であり、このパッチのスコープには含まない。
 
-設計・要件は [`docs/design.md`](docs/design.md)、調査の背景は
-[`../zed-writing-tools/docs/scratch-buffer-research.md`](../zed-writing-tools/docs/scratch-buffer-research.md)
-を参照。
+設計・要件は [`docs/design.md`](docs/design.md)、検証結果は
+[`docs/verification.md`](docs/verification.md) を参照。
 
 ## 構成
 
