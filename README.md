@@ -31,13 +31,14 @@ docs/verification.md   # 検証記録
 
 ## 設定
 
-`settings.json` の `workspace.scratch_buffers_enabled`（既定 `false`）で有効化する。
+`settings.json` の `scratch_buffers_enabled`（既定 `false`）で有効化する。
+`WorkspaceSettingsContent` は `SettingsContent` に `#[serde(flatten)]` で
+組み込まれているため、`"workspace": { ... }` のようにネストせず、
+トップレベル直下に書く。
 
 ```json
 {
-  "workspace": {
-    "scratch_buffers_enabled": true
-  }
+  "scratch_buffers_enabled": true
 }
 ```
 

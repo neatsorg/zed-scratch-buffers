@@ -88,12 +88,24 @@ Zed では同じバッファ（同じ下書き）を複数のペインに分割�
 - 閉じた下書きを見つけ直す手段（ファイルマネージャ等での直接探索）を、この機能の
   範囲として作り込む必要はない。
 
-### 5. 既定オフの設定項目: `workspace.scratch_buffers_enabled`（既定 `false`）
+### 5. 既定オフの設定項目: `scratch_buffers_enabled`（既定 `false`）
 
 `WorkspaceSettingsContent`（`crates/settings_content/src/workspace.rs`）に
 `scratch_buffers_enabled: Option<bool>` を追加し、`assets/settings/default.json` で
 `false` を既定値にした。`Editor::new_in_workspace` の先頭でこの設定を確認し、無効なら
 従来どおりファイルなしのバッファを作る分岐にフォールバックする。
+
+**注意（2026-09-20 の統合ビルド検証で判明）**: `SettingsContent` 構造体では
+`pub workspace: WorkspaceSettingsContent` に `#[serde(flatten)]` が付いており、
+`WorkspaceSettingsContent` の各フィールドは `settings.json` の**トップレベル直下**に
+展開される。したがって `settings.json` では `"workspace": { "scratch_buffers_enabled": true }`
+ではなく `"scratch_buffers_enabled": true` と書く必要がある。誤ってネストして書くと、
+Zed は未知のプロパティとして黙って無視する（パースエラーにはならない）ため、
+設定が反映されないまま気づきにくい失敗をする。Rust コード側で
+`SettingsContent` の値を直接組み立てる場合（例: テストヘルパー）は
+`settings.workspace.scratch_buffers_enabled` のようにフィールドパスで書いてよい
+（`#[serde(flatten)]` は JSON シリアライズ表現にのみ影響し、Rust 構造体の
+フィールドパスには影響しない）。
 
 ### 6. 番号管理の拡張: 経路を問わない予約、保存成功時の即時解放
 （2026-09-20、レビュー指摘を受けて追加）
