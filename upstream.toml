@@ -1,0 +1,6 @@
+[zed]
+repository = "https://github.com/zed-industries/zed"
+# v1.20.2. Keep in sync with the commit zed-i18n and zed-word-counter currently pin
+# (zed-i18n's config/project.toml, zed-word-counter's upstream.toml) so the patch is
+# verified against the same source zed-i18n will apply it to.
+commit = "7c451e694f3c52ee0aeb01d7e28b5fa18cd0ad2f"

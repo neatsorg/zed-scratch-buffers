@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Prepares a local checkout of the pinned Zed commit (see upstream.toml) under
+# .checkout/zed and applies every patch in patches/, in order.
+#
+# Usage: scripts/prepare [--source <path-or-url>]
+#   --source   Clone from this path/URL instead of upstream.toml's repository.
+#              Useful to bootstrap from a local clone (e.g. zed-i18n's own
+#              pristine checkout) instead of a fresh network clone.
+set -euo pipefail
+
+root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+checkout_dir="$root_dir/.checkout/zed"
+upstream_toml="$root_dir/upstream.toml"
+
+source_override=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --source)
+            source_override="$2"
+            shift 2
+            ;;
+        *)
+            echo "unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+repository=$(grep '^repository' "$upstream_toml" | sed -E 's/^repository = "(.*)"$/\1/')
+commit=$(grep '^commit' "$upstream_toml" | sed -E 's/^commit = "([^"]*)".*$/\1/')
+source="${source_override:-$repository}"
+
+if [[ ! -d "$checkout_dir/.git" ]]; then
+    echo "Cloning $source into $checkout_dir"
+    mkdir -p "$(dirname "$checkout_dir")"
+    git clone --no-checkout "$source" "$checkout_dir"
+    git -C "$checkout_dir" fetch --depth 1 origin "$commit" || true
+    git -C "$checkout_dir" checkout --quiet "$commit"
+else
+    current_commit=$(git -C "$checkout_dir" rev-parse HEAD)
+    if [[ "$current_commit" != "$commit" ]]; then
+        echo "error: $checkout_dir is at $current_commit, expected $commit" >&2
+        echo "Remove $checkout_dir and rerun, or resolve the mismatch manually." >&2
+        exit 1
+    fi
+    if [[ -n "$(git -C "$checkout_dir" status --porcelain)" ]]; then
+        echo "error: $checkout_dir has local changes; refusing to touch it." >&2
+        echo "Reset it yourself (git -C '$checkout_dir' checkout -- . && git -C '$checkout_dir' clean -fd) and rerun." >&2
+        exit 1
+    fi
+fi
+
+shopt -s nullglob
+patches=("$root_dir"/patches/*.patch)
+shopt -u nullglob
+if [[ ${#patches[@]} -eq 0 ]]; then
+    echo "no patches found under $root_dir/patches"
+    exit 0
+fi
+
+for patch in "${patches[@]}"; do
+    if git -C "$checkout_dir" apply --check "$patch" 2>/dev/null; then
+        echo "Applying $(basename "$patch")"
+        git -C "$checkout_dir" apply "$patch"
+    elif git -C "$checkout_dir" apply --reverse --check "$patch" 2>/dev/null; then
+        echo "Already applied: $(basename "$patch")"
+    else
+        echo "error: $(basename "$patch") does not apply cleanly to $commit" >&2
+        exit 1
+    fi
+done
+
+echo "Ready: $checkout_dir"
