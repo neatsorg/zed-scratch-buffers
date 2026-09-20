@@ -156,6 +156,111 @@ docs/design.md 確定事項3（分割ペインで最後の表示を閉じた際�
 `cargo test --lib` を `editor`・`workspace` の両クレートに対して実行）が
 成功することも確認した。
 
+## 2026-09-20: レビュー対応
+
+統合検証に進む前に受けたコードレビューで、3件の問題と2件の改善点が指摘された。
+検証したところ、指摘のうち番号管理に関する2件（最優先・優先）はコードを直接確認し
+事実と判明したため対応した。
+
+### 1. 再起動後の番号衝突（最優先、対応済み）
+
+- **`paths::temp_dir()` の実態**: `crates/paths/src/paths.rs` を確認したところ、
+  Linux では `$XDG_RUNTIME_DIR` ではなく `dirs::cache_dir()`（`~/.cache/zed` 相当）を
+  返しており、再起動やログアウトでは消えない。design.md の「再起動で消える」という
+  前提と実装が食い違っていた。
+  - 対応: 保存先ディレクトリ自体は変更せず、docs/design.md 確定事項2を
+    「Hot Exit のために意図的に残す」前提に改訂した（詳細は同ファイル参照）。
+- **Hot Exit 復元時に番号が未予約**: `allocate_display_number` の呼び出し元が
+  `new_scratch_buffer_path`（新規作成時のみ）に限られており、Hot Exit 等で
+  `Editor::for_buffer` 経由で scratch パスのバッファが復元されても、番号が
+  プロセス内の管理状態に登録されないことをコードで確認した。
+  - 対応: `Editor::new_internal`（`for_buffer`／`for_multibuffer`／`clone`／Hot Exit
+    復元のいずれも最終的に通る共通コンストラクタ）に
+    `reserve_scratch_buffer_number_if_applicable` を追加し、経路を問わず
+    singleton バッファが scratch パスを持てば番号を予約するよう一元化した
+    （docs/design.md 確定事項6）。
+
+### 2. 保存後も番号が解放されない（対応済み）
+
+`release_display_number` の呼び出し箇所を全て確認したところ、`on_release`
+（バッファ完全 drop 時）と作成失敗時の2経路しかなく、保存成功による即時解放が
+存在しないことを確認した。
+
+- 対応: `multi_buffer::Event::FileHandleChanged`（保存成功時に発火）で
+  `release_scratch_buffer_number_if_no_longer_scratch` を呼ぶようにした。
+- 実装の過程で、単純な無条件解放だと「保存成功時の即時解放」と
+  「`on_release`」という2つの独立した解放経路が同じ番号に対して存在するため、
+  片方が解放した直後にその番号が新しい下書きへ再割り当てされ、もう片方が
+  無関係な別の下書きの番号を誤って解放してしまう事故が起こりうると判断した。
+  `workspace::scratch_buffers` にバッファ ID ベースの所有者管理
+  （`associate_display_number_with_buffer`／`display_number_for_buffer`／
+  `release_display_number_owned_by`）を追加し、所有者が一致する場合のみ解放する
+  ことでこれを防いだ（`workspace` クレートに `text` 依存を追加、`BufferId` を使う
+  ため）。単体テスト
+  `owned_release_ignores_numbers_reassigned_to_another_buffer` でこの事故が
+  起きないことを検証済み。
+
+### 3. i18n 未対応（対応不要と確認）
+
+`docs/repository-separation-plan.md` の合意事項（新機能の翻訳接続は統合側
+= zed-personal-build で管理し、機能パッチ自体は英語で成立させる）に従っている
+ため、zed-scratch-buffers 単体パッチとしては設計違反ではないと確認した。
+`format!("Untitled-{number}")` が実際に i18n 側の抽出・翻訳を通るかどうかは、
+zed-personal-build での統合検証項目として `sources.lock.toml` に記録した
+（このパッチ側での対応は不要）。
+
+### 5. 補足的な改善点（対応済み）
+
+- `is_scratch_path` が親ディレクトリ名の UUID 形式を検証していなかった点を修正。
+  `scratch_display_number` 内で `uuid::Uuid::parse_str` により厳密に検証し、
+  `is_scratch_path` もこれを使うようにした。単体テストを追加。
+- パッチファイルの trailing whitespace: `git diff --cached --check` で確認したが、
+  今回作成した差分には該当箇所がなかった（レビュー時点の差分に含まれていた
+  箇所は、今回の追加修正で書き換えられ解消された）。
+- 保存後に残る旧い `buffer.txt` の残骸蓄積、起動時クリーンアップについては、
+  docs/design.md 確定事項2の改訂に伴い「今回のスコープでは見送り」と記録した。
+
+### 追加したテスト
+
+- `test_reopened_scratch_buffer_reserves_its_number`（`crates/zed/src/zed.rs`）:
+  `SerializableItem::deserialize` の abs_path 分岐と同じ経路
+  （`project.open_local_buffer` → `Editor::for_buffer`）で既存の scratch ファイルを
+  開き直し、番号が予約されること、その状態で新規作成した下書きと番号が衝突しない
+  ことを検証。
+- `test_open_and_save_new_file` に、保存完了直後（`Editor` を閉じる前）に番号が
+  解放されていることの検証を追加。
+- `scratch_buffers.rs` に `owned_release_ignores_numbers_reassigned_to_another_buffer`・
+  `reserve_display_number_is_idempotent_and_blocks_reallocation` を追加。
+
+### 並列実行での新たな flaky 化と対処
+
+上記のテストを追加した直後、`zed --bin zed` をフルスイートで繰り返し実行すると
+`test_open_and_save_new_file` が時々失敗した。原因は、追加した
+「保存直後に番号が解放されていること」のアサーションが、並列実行される他のテストの
+番号採番と競合していたため（`enable_scratch_buffers` を呼ぶ4つのテストのうち、
+`test_synchronization_lock` を取っていないものがあった）。
+
+対処: `enable_scratch_buffers` ヘルパー自体が `test_synchronization_lock` を取得して
+返すように変更し（`#[must_use]`、呼び出し元は `let _scratch_buffers_lock =
+enable_scratch_buffers(cx);` で束縛）、scratch buffers を有効化する4つのテスト
+全てを自動的に直列化した。
+
+### テスト結果（レビュー対応後）
+
+- `cargo test -p workspace`: 274 件成功（新規2件含む）。
+- `cargo test -p editor`: 1011 件成功。
+- `cargo test -p project_panel`: 125 件成功。
+- `cargo test -p command_palette`: 21 件成功。
+- `cargo test -p zed --bin zed`: 94 件成功（新規1件含む）。10回の連続実行で
+  私が触れた4テストは一度も失敗せず、既存の無関係な flaky テスト
+  （`test_multi_workspace_session_restore`・
+  `test_restored_project_groups_survive_workspace_key_change`、いずれも
+  "session restore" 系）は、対象テストを `--skip` で除外しても同程度の頻度
+  （5回中1〜3回）で再現することを確認した。
+- パッチを `patches/0001-scratch-buffers.patch` として再生成し、クリーンな
+  `7c451e694f3c52ee0aeb01d7e28b5fa18cd0ad2f` への単独適用・`scripts/check`
+  （editor 1011件・workspace 274件）の成功を再確認した。
+
 ### 未実施（次フェーズ）
 
 - `cargo check`／`cargo test` レベルの検証のみ。`zed-personal-build` 側での
@@ -163,3 +268,7 @@ docs/design.md 確定事項3（分割ペインで最後の表示を閉じた際�
 - `docs/scratch-buffer-research.md` にある「保存済みファイルの未保存の編集」と
   「一度も保存していない新規タブ」の区別が、この実装によって解消されたことの
   実機（[redacted-host]）確認。
+- i18n 側で `format!("Untitled-{number}")` が抽出・翻訳可能かの確認
+  （統合検証項目、上記「3. i18n 未対応」参照）。
+- 起動時の古い scratch エントリのクリーンアップ（今回は見送り、
+  docs/design.md 確定事項2参照）。

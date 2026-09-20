@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 75a6f1a..a545d40 100644
+index 75a6f1a..e8ea134 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -22245,6 +22245,7 @@ dependencies = [
@@ -10,6 +10,14 @@ index 75a6f1a..a545d40 100644
   "postage",
   "pretty_assertions",
   "project",
+@@ -22263,6 +22264,7 @@ dependencies = [
+  "task",
+  "telemetry",
+  "tempfile",
++ "text",
+  "theme",
+  "theme_settings",
+  "ui",
 diff --git a/assets/settings/default.json b/assets/settings/default.json
 index 3f1eca5..f4fe45c 100644
 --- a/assets/settings/default.json
@@ -26,9 +34,22 @@ index 3f1eca5..f4fe45c 100644
    // May take 3 values:
    //  1. All workspaces open during last session
 diff --git a/crates/editor/src/editor.rs b/crates/editor/src/editor.rs
-index 9602d85..8070044 100644
+index 9602d85..b0d3c4d 100644
 --- a/crates/editor/src/editor.rs
 +++ b/crates/editor/src/editor.rs
+@@ -210,9 +210,9 @@ use parking_lot::Mutex;
+ use persistence::EditorDb;
+ use project::{
+     BreakpointWithPosition, CodeAction, Completion, CompletionDisplayOptions, CompletionIntent,
+-    CompletionResponse, CompletionSource, DisableAiSettings, DocumentHighlight, InlayHint, InlayId,
+-    InvalidationStrategy, Location, LocationLink, LspAction, PrepareRenameResponse, Project,
+-    ProjectItem, ProjectPath, ProjectTransaction,
++    CompletionResponse, CompletionSource, DisableAiSettings, DocumentHighlight, File, InlayHint,
++    InlayId, InvalidationStrategy, Location, LocationLink, LspAction, PrepareRenameResponse,
++    Project, ProjectItem, ProjectPath, ProjectTransaction,
+     bookmark_store::BookmarkStore,
+     debugger::{
+         breakpoint_store::{
 @@ -273,6 +273,7 @@ use workspace::{
      TabBarSettings, Toast, ViewId, Workspace, WorkspaceId, WorkspaceSettings,
      item::{ItemBufferKind, ItemHandle, PreviewTabsSettings, SaveOptions},
@@ -37,7 +58,93 @@ index 9602d85..8070044 100644
      searchable::SearchEvent,
  };
  pub use zed_actions::editor::RevealInFileManager;
-@@ -2957,12 +2958,74 @@ impl Editor {
+@@ -2698,6 +2699,7 @@ impl Editor {
+ 
+             if let Some(buffer) = multi_buffer.read(cx).as_singleton() {
+                 editor.register_buffer(buffer.read(cx).remote_id(), cx);
++                Self::reserve_scratch_buffer_number_if_applicable(&buffer, cx);
+             }
+             editor.report_editor_event(ReportEditorEvent::EditorOpened, None, cx);
+         }
+@@ -2705,6 +2707,77 @@ impl Editor {
+         editor
+     }
+ 
++    /// バッファが下書き（scratch buffer）の実体ファイルを指していれば、パスに
++    /// 埋め込まれた表示番号を予約してバッファに紐づけ、そのバッファへの最後の
++    /// 参照が消えたときに解放するフックを登録する。
++    ///
++    /// `Editor::new_internal`（`for_buffer`／`for_multibuffer`／`clone`／Hot Exit
++    /// 復元のいずれも最終的にここを通る）から呼ぶことで、`workspace::NewFile` 経由の
++    /// 新規作成だけでなく、Hot Exit で下書きが復元された場合にも番号が重複して
++    /// 採番されないようにする。`reserve_display_number`・
++    /// `associate_display_number_with_buffer` は冪等、`on_release` は複数回登録
++    /// されても実害がない（`release_display_number_owned_by` は所有者が一致する
++    /// ときだけ解放するので、既に他の下書きへ再割り当て済みの番号を誤って
++    /// 解放しない）ため、同じバッファに対して複数回呼ばれても安全。
++    ///
++    /// 保存成功でファイルパスが scratch から外れた場合の即時解放は、ここではなく
++    /// `on_buffer_event` の `FileHandleChanged` ケースで行う
++    /// （`display_number_for_buffer` によるバッファ ID からの逆引きを使う。
++    /// 新しいパスはもう scratch パスではないため `scratch_display_number` では
++    /// 番号を求められない）。
++    fn reserve_scratch_buffer_number_if_applicable(buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
++        let Some(file) = buffer.read(cx).file() else {
++            return;
++        };
++        let Some(project_file) = File::from_dyn(Some(file)) else {
++            return;
++        };
++        let abs_path = project_file.abs_path(cx);
++        let Some(number) = workspace::scratch_buffers::scratch_display_number(&abs_path) else {
++            return;
++        };
++        workspace::scratch_buffers::reserve_display_number(number);
++        let buffer_id = buffer.read(cx).remote_id();
++        workspace::scratch_buffers::associate_display_number_with_buffer(number, buffer_id);
++        buffer.update(cx, |_, cx| {
++            cx.on_release(move |_buffer, _cx| {
++                workspace::scratch_buffers::release_display_number_owned_by(number, buffer_id);
++            })
++            .detach();
++        });
++    }
++
++    /// 下書き（scratch buffer）が「名前を付けて保存」等で正式なファイルへ移行した
++    /// （もう scratch パスを指していない）場合、予約していた表示番号を即座に解放する。
++    ///
++    /// `on_buffer_event` の `multi_buffer::Event::FileHandleChanged` から呼ぶ。保存
++    /// 成功でファイルパスが変わった直後は、そのバッファへの参照（Editor 自身）は
++    /// まだ生きているため `on_release` は発火しない。実装要件「通常の保存で正式
++    /// 保存先を尋ねる。成功時だけ通常ファイルへ移行」した以上、移行が完了した
++    /// 時点でその番号は次の新規下書きに使えるべき、という要件に対応する
++    /// （docs/verification.md 参照）。分割ペインで同じバッファが複数表示されていても、
++    /// 各 `Editor` がこのイベントを受け取るたびに呼ばれるが
++    /// `release_display_number_owned_by` は所有者一致時のみ・実質1回しか解放しない
++    /// ので安全。
++    fn release_scratch_buffer_number_if_no_longer_scratch(&self, cx: &mut Context<Self>) {
++        let Some(buffer) = self.buffer.read(cx).as_singleton() else {
++            return;
++        };
++        let buffer_id = buffer.read(cx).remote_id();
++        let Some(number) = workspace::scratch_buffers::display_number_for_buffer(buffer_id) else {
++            return;
++        };
++        let still_scratch = buffer
++            .read(cx)
++            .file()
++            .and_then(|file| File::from_dyn(Some(file)))
++            .map(|file| file.abs_path(cx))
++            .is_some_and(|path| workspace::scratch_buffers::is_scratch_path(&path));
++        if !still_scratch {
++            workspace::scratch_buffers::release_display_number_owned_by(number, buffer_id);
++        }
++    }
++
+     pub fn display_snapshot(&self, cx: &mut App) -> DisplaySnapshot {
+         self.display_map.update(cx, |map, cx| map.snapshot(cx))
+     }
+@@ -2957,13 +3030,71 @@ impl Editor {
          cx: &mut Context<Workspace>,
      ) -> Task<Result<Entity<Editor>>> {
          let project = workspace.project().clone();
@@ -76,8 +183,6 @@ index 9602d85..8070044 100644
  
          cx.spawn_in(window, async move |workspace, cx| {
 -            let buffer = create.await?;
--            buffer.update(cx, |buffer, _| {
--                buffer.set_content_language_detection_enabled(true);
 +            let create_buffer_file = async {
 +                if let Some(parent) = scratch_path.parent() {
 +                    fs.create_dir(parent).await?;
@@ -100,23 +205,21 @@ index 9602d85..8070044 100644
 +                    return Err(err);
 +                }
 +            };
-+            buffer.update(cx, |buffer, cx| {
+             buffer.update(cx, |buffer, _| {
+-                buffer.set_content_language_detection_enabled(true);
 +                // 内容から言語を推測させると Plain Text から変わってしまいうるため、
 +                // 下書きは初期言語を Plain Text に固定する（自動判定を無効化）。
 +                buffer.set_content_language_detection_enabled(false);
-+                // このバッファへの最後の参照（分割ペインでの複数表示を含む）が消えた
-+                // ときにのみ表示番号を解放する。docs/design.md「3. 分割ペインで最後の
-+                // 表示を閉じた際の扱い」参照。保存によって scratch のパスから外れた
-+                // 場合でも、この解放自体は無害（is_scratch_path はもう関係ない番号を
-+                // 二重解放するだけで、他の下書きの番号には影響しない）。
-+                cx.on_release(move |_buffer, _cx| {
-+                    scratch_buffers::release_display_number(display_number);
-+                })
-+                .detach();
              });
++            // 表示番号の予約・最後の参照が消えたときの解放は、経路を問わず一元的に
++            // Editor::new_internal（reserve_scratch_buffer_number_if_applicable）が
++            // 行う。ここで採番した display_number は、この後の Editor::for_buffer
++            // 呼び出しでそちらから再確認・登録される（reserve は冪等なので二重登録には
++            // ならない）。
              workspace.update_in(cx, |workspace, window, cx| {
                  let editor =
-@@ -3080,6 +3143,9 @@ impl Editor {
+                     cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
+@@ -3080,6 +3211,9 @@ impl Editor {
      }
  
      pub fn title<'a>(&self, cx: &'a App) -> Cow<'a, str> {
@@ -126,6 +229,14 @@ index 9602d85..8070044 100644
          self.buffer().read(cx).title(cx)
      }
  
+@@ -10091,6 +10225,7 @@ impl Editor {
+             multi_buffer::Event::FileHandleChanged => {
+                 cx.emit(EditorEvent::TitleChanged);
+                 cx.emit(EditorEvent::FileHandleChanged);
++                self.release_scratch_buffer_number_if_no_longer_scratch(cx);
+             }
+             multi_buffer::Event::CapabilityChanged => {
+                 cx.emit(EditorEvent::CapabilityChanged);
 diff --git a/crates/editor/src/items.rs b/crates/editor/src/items.rs
 index 163602b..fde55c7 100644
 --- a/crates/editor/src/items.rs
@@ -239,7 +350,7 @@ index e38b902..0fa5b1c 100644
      ///
      /// Default: true
 diff --git a/crates/workspace/Cargo.toml b/crates/workspace/Cargo.toml
-index 55a47c7..93fb802 100644
+index 55a47c7..5d17de6 100644
 --- a/crates/workspace/Cargo.toml
 +++ b/crates/workspace/Cargo.toml
 @@ -50,6 +50,7 @@ menu.workspace = true
@@ -250,12 +361,20 @@ index 55a47c7..93fb802 100644
  postage.workspace = true
  project.workspace = true
  release_channel.workspace = true
+@@ -64,6 +65,7 @@ sqlez.workspace = true
+ strum.workspace = true
+ task.workspace = true
+ telemetry.workspace = true
++text.workspace = true
+ theme.workspace = true
+ theme_settings.workspace = true
+ ui.workspace = true
 diff --git a/crates/workspace/src/scratch_buffers.rs b/crates/workspace/src/scratch_buffers.rs
 new file mode 100644
-index 0000000..086d07c
+index 0000000..ccfb38e
 --- /dev/null
 +++ b/crates/workspace/src/scratch_buffers.rs
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,307 @@
 +//! 未保存の新規タブ（`Untitled-N` 相当）を、内部的には永続データ領域の `.txt` として
 +//! 管理するためのパス生成・判定・表示番号の割り当て。
 +//!
@@ -265,9 +384,11 @@ index 0000000..086d07c
 +//! 判定関数（[`is_scratch_path`]）で確認し、呼び出し側（editor クレートのタブ表示）が
 +//! その場合だけ `Untitled-N` を表示する。
 +
-+use std::collections::BTreeSet;
++use std::collections::{BTreeSet, HashMap};
 +use std::path::{Path, PathBuf};
 +use std::sync::{Mutex, OnceLock};
++
++use text::BufferId;
 +
 +/// 各下書きの実体ファイル名。番号や UUID をファイル名自体に混ぜず、親ディレクトリ名
 +/// （`<display_number>-<uuid>`）だけに寄せることで、判定条件を「専用ディレクトリ配下」
@@ -277,9 +398,11 @@ index 0000000..086d07c
 +/// 下書きを置く専用ディレクトリの名前（`paths::temp_dir()` 配下）。
 +const SCRATCH_BUFFERS_DIR_NAME: &str = "scratch-buffers";
 +
-+/// 下書きを保存する専用ディレクトリ。プロセスの再起動で消えて構わない領域
-+/// （`paths::temp_dir()`）配下に置く。あくまでバッファであり、恒久的な保管は求めない
-+/// という合意に基づく（docs/design.md 参照）。
++/// 下書きを保存する専用ディレクトリ。`paths::temp_dir()`（Linux では実際には
++/// `$XDG_RUNTIME_DIR` ではなく `~/.cache/zed` 相当で、再起動しても消えない）配下に
++/// 置く。実ファイルである以上 Hot Exit の復元対象になるため、意図的に残す
++/// （docs/design.md 確定事項2参照。恒久的な保管を積極的に目指すものではないが、
++/// 削除しないことで Hot Exit を機能させることを優先する）。
 +pub fn scratch_root_dir() -> PathBuf {
 +    paths::temp_dir().join(SCRATCH_BUFFERS_DIR_NAME)
 +}
@@ -288,18 +411,22 @@ index 0000000..086d07c
 +///
 +/// 単純な文字列プレフィックス一致ではなく、パスのコンポーネント境界で
 +/// [`scratch_root_dir`] 配下にあることと、ファイル名が
-+/// [`SCRATCH_BUFFER_FILE_NAME`] と一致することの両方を確認する。これにより、
++/// [`SCRATCH_BUFFER_FILE_NAME`] と一致することに加え、親ディレクトリ名が
++/// `<display_number>-<uuid>` という正確な形式であることまで確認する。これにより、
 +/// 偶然似た名前を持つだけの通常のユーザーファイルを誤って下書き扱いしない。
 +pub fn is_scratch_path(path: &Path) -> bool {
 +    path.file_name().and_then(|name| name.to_str()) == Some(SCRATCH_BUFFER_FILE_NAME)
 +        && path.starts_with(scratch_root_dir())
++        && scratch_display_number(path).is_some()
 +}
 +
-+/// `is_scratch_path(path)` が真であることを前提に、パスに埋め込まれた表示番号を返す。
-+/// パスの形式は `scratch_root_dir()/<display_number>-<uuid>/buffer.txt`。
++/// パスに埋め込まれた表示番号を返す。パスの形式は
++/// `scratch_root_dir()/<display_number>-<uuid>/buffer.txt` で、`<uuid>` が正しい
++/// UUID でなければ `None`（[`is_scratch_path`] もこれを使って誤判定を防ぐ）。
 +pub fn scratch_display_number(path: &Path) -> Option<usize> {
 +    let dir_name = path.parent()?.file_name()?.to_str()?;
-+    let (number, _uuid) = dir_name.split_once('-')?;
++    let (number, uuid) = dir_name.split_once('-')?;
++    uuid::Uuid::parse_str(uuid).ok()?;
 +    number.parse().ok()
 +}
 +
@@ -329,6 +456,20 @@ index 0000000..086d07c
 +    candidate
 +}
 +
++/// `number` を使用中として記録する。既に使用中でも冪等（何もしない）。
++///
++/// 新規下書き作成時は [`allocate_display_number`] が空いている番号を選んで採番する。
++/// 一方、Hot Exit 等で外部から scratch パスのバッファが復元された場合は、番号は
++/// パスに既に埋め込まれている（[`scratch_display_number`]）ので、その番号をこの
++/// 関数で予約する。呼び出し元は `Editor::new_internal` に一元化されている
++/// （経路を問わず、singleton バッファが scratch パスを指していればここを通る）。
++pub fn reserve_display_number(number: usize) {
++    active_display_numbers()
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++        .insert(number);
++}
++
 +/// 表示番号を解放し、以後の [`allocate_display_number`] で再利用できるようにする。
 +///
 +/// 呼び出し側は、そのバッファへの最後の参照（最後の表示）が消えたときにのみこれを
@@ -339,6 +480,70 @@ index 0000000..086d07c
 +        .lock()
 +        .unwrap_or_else(std::sync::PoisonError::into_inner)
 +        .remove(&number);
++}
++
++/// 番号とバッファの対応を双方向に保つ。`number_to_buffer` は所有者チェック
++/// （[`release_display_number_owned_by`]）に、`buffer_to_number` は「このバッファが
++/// 持っていた番号」の逆引き（[`display_number_for_buffer`]、保存でファイルパスが
++/// scratch から外れた後は `scratch_display_number` でパスから番号を求められない
++/// ため必要）に使う。
++#[derive(Default)]
++struct Ownership {
++    number_to_buffer: HashMap<usize, BufferId>,
++    buffer_to_number: HashMap<BufferId, usize>,
++}
++
++fn ownership() -> &'static Mutex<Ownership> {
++    static OWNERSHIP: OnceLock<Mutex<Ownership>> = OnceLock::new();
++    OWNERSHIP.get_or_init(|| Mutex::new(Ownership::default()))
++}
++
++/// `number` の所有者を `buffer_id` として記録する。同じ組み合わせを複数回呼んでも
++/// 冪等（分割ペインで同じバッファに対し複数の `Editor` が呼ぶことを想定）。
++///
++/// 保存成功による即時解放（[`release_display_number_owned_by`]）を安全にするための
++/// 前提: `allocate_display_number`／`reserve_display_number` で確保した番号は、
++/// 実際にそれを使うバッファが判明した時点でこれを呼んで紐づけること。
++pub fn associate_display_number_with_buffer(number: usize, buffer_id: BufferId) {
++    let mut ownership = ownership()
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    ownership.number_to_buffer.insert(number, buffer_id);
++    ownership.buffer_to_number.insert(buffer_id, number);
++}
++
++/// `buffer_id` に紐づく表示番号を返す（まだ [`release_display_number_owned_by`] で
++/// 解放していなければ）。保存によってバッファのファイルパスが scratch パスから
++/// 外れた後は、そのパスから番号を逆算できない（[`scratch_display_number`] は新しい
++/// パスに対して `None` を返す）ため、このバッファ ID ベースの逆引きが必要になる。
++pub fn display_number_for_buffer(buffer_id: BufferId) -> Option<usize> {
++    ownership()
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++        .buffer_to_number
++        .get(&buffer_id)
++        .copied()
++}
++
++/// `number` の所有者が `buffer_id` と一致する場合にのみ解放する。一致しなければ
++/// 何もしない。
++///
++/// 単純な `release_display_number(number)` だと、同じ番号に対して複数の解放経路
++/// （保存成功時の即時解放、バッファが完全に破棄されたときの `on_release`）が
++/// 独立に登録されうるため、片方が解放した直後にその番号が新しい下書きへ
++/// 再割り当てされ、もう片方が"自分の番号のつもり"でそれを解放してしまう
++/// （＝無関係な別の下書きの番号を奪う）事故が起こりうる。所有者チェックにより、
++/// 既に別のバッファへ再割り当て済みの番号を誤って解放しない。
++pub fn release_display_number_owned_by(number: usize, buffer_id: BufferId) {
++    let mut ownership = ownership()
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    if ownership.number_to_buffer.get(&number) == Some(&buffer_id) {
++        ownership.number_to_buffer.remove(&number);
++        ownership.buffer_to_number.remove(&buffer_id);
++        drop(ownership);
++        release_display_number(number);
++    }
 +}
 +
 +/// `number` が現在採番済み（未解放）かどうかを返す。分割ペインでの解放タイミング
@@ -402,6 +607,66 @@ index 0000000..086d07c
 +        // ファイル名が一致しない場合も誤判定しない。
 +        let wrong_name = scratch_root_dir().join("1-deadbeef").join("notes.txt");
 +        assert!(!is_scratch_path(&wrong_name));
++
++        // 親ディレクトリ名が <number>-<uuid> の正確な形式でない場合も誤判定しない
++        // （UUID 部分が不正、番号部分が不正）。
++        let bad_uuid = scratch_root_dir()
++            .join("1-not-a-real-uuid")
++            .join(SCRATCH_BUFFER_FILE_NAME);
++        assert!(!is_scratch_path(&bad_uuid));
++        let bad_number = scratch_root_dir()
++            .join(format!("abc-{}", uuid::Uuid::new_v4()))
++            .join(SCRATCH_BUFFER_FILE_NAME);
++        assert!(!is_scratch_path(&bad_number));
++    }
++
++    #[test]
++    fn reserve_display_number_is_idempotent_and_blocks_reallocation() {
++        let _guard = test_synchronization_lock();
++        reserve_display_number(1);
++        reserve_display_number(1);
++        assert!(is_display_number_in_use(1));
++        // A fresh allocation must skip the reserved number.
++        let allocated = allocate_display_number();
++        assert_ne!(allocated, 1);
++        release_display_number(1);
++        release_display_number(allocated);
++    }
++
++    #[test]
++    fn owned_release_ignores_numbers_reassigned_to_another_buffer() {
++        let _guard = test_synchronization_lock();
++        let buffer_a = BufferId::new(1).unwrap();
++        let buffer_b = BufferId::new(2).unwrap();
++
++        let number = allocate_display_number();
++        associate_display_number_with_buffer(number, buffer_a);
++        assert_eq!(display_number_for_buffer(buffer_a), Some(number));
++
++        // Simulate buffer_a's save-triggered release racing with buffer_b claiming
++        // the same number, then buffer_a's on_release firing afterwards: it must
++        // not steal buffer_b's number.
++        release_display_number_owned_by(number, buffer_a);
++        assert!(!is_display_number_in_use(number));
++        assert_eq!(display_number_for_buffer(buffer_a), None);
++
++        let reallocated = allocate_display_number();
++        assert_eq!(reallocated, number, "the freed number should be reused");
++        associate_display_number_with_buffer(reallocated, buffer_b);
++        assert_eq!(display_number_for_buffer(buffer_b), Some(reallocated));
++
++        // A stale release for buffer_a (e.g. its on_release firing late) must be a
++        // no-op now that the number belongs to buffer_b.
++        release_display_number_owned_by(reallocated, buffer_a);
++        assert!(
++            is_display_number_in_use(reallocated),
++            "stale release from the old owner must not free buffer_b's number"
++        );
++        assert_eq!(display_number_for_buffer(buffer_b), Some(reallocated));
++
++        // The real owner can still release it normally.
++        release_display_number_owned_by(reallocated, buffer_b);
++        assert!(!is_display_number_in_use(reallocated));
 +    }
 +
 +    #[test]
@@ -450,7 +715,7 @@ index eff3a0a..19b8367 100644
              autosave: workspace.autosave.unwrap(),
              restore_on_startup: workspace.restore_on_startup.unwrap(),
 diff --git a/crates/zed/src/zed.rs b/crates/zed/src/zed.rs
-index 2bce5d0..e106b12 100644
+index 2bce5d0..7365d96 100644
 --- a/crates/zed/src/zed.rs
 +++ b/crates/zed/src/zed.rs
 @@ -2876,7 +2876,7 @@ mod tests {
@@ -466,11 +731,26 @@ index 2bce5d0..e106b12 100644
      #[gpui::test]
      async fn test_open_and_save_new_file(cx: &mut TestAppContext) {
          let app_state = init_test(cx);
-+        enable_scratch_buffers(cx);
++        let _scratch_buffers_lock = enable_scratch_buffers(cx);
          app_state
              .fs
              .create_dir(Path::new(path!("/root")))
-@@ -4515,7 +4516,11 @@ mod tests {
+@@ -4510,12 +4511,26 @@ mod tests {
+                 .downcast::<Editor>()
+                 .unwrap()
+         });
++        let scratch_number = cx.read(|cx| {
++            let buffer = editor.read(cx).buffer().read(cx).as_singleton().unwrap();
++            let file = buffer.read(cx).file().unwrap();
++            let abs_path = project::File::from_dyn(Some(file)).unwrap().abs_path(cx);
++            workspace::scratch_buffers::scratch_display_number(&abs_path)
++                .expect("new scratch buffer must have a display number")
++        });
++        assert!(workspace::scratch_buffers::is_display_number_in_use(
++            scratch_number
++        ));
+ 
+         window
              .update(cx, |_, window, cx| {
                  editor.update(cx, |editor, cx| {
                      assert!(!editor.is_dirty(cx));
@@ -483,7 +763,7 @@ index 2bce5d0..e106b12 100644
                      assert!(Arc::ptr_eq(
                          &editor
                              .buffer()
-@@ -4524,6 +4529,19 @@ mod tests {
+@@ -4524,6 +4539,19 @@ mod tests {
                              .unwrap(),
                          &languages::PLAIN_TEXT
                      ));
@@ -503,7 +783,7 @@ index 2bce5d0..e106b12 100644
                      editor.handle_input("hi", window, cx);
                      assert!(editor.is_dirty(cx));
                  });
-@@ -4545,7 +4563,11 @@ mod tests {
+@@ -4545,12 +4573,21 @@ mod tests {
          });
          cx.read(|cx| {
              assert!(editor.is_dirty(cx));
@@ -516,7 +796,17 @@ index 2bce5d0..e106b12 100644
          });
  
          // When the save completes, the buffer's title is updated and the language is assigned based
-@@ -4646,9 +4668,147 @@ mod tests {
+         // on the path.
+         save_task.await.unwrap();
++        // docs/design.md 確定事項6: 保存成功で scratch パスから外れた時点で、
++        // Editor を閉じるのを待たず即座に番号が解放される。
++        assert!(!workspace::scratch_buffers::is_display_number_in_use(
++            scratch_number
++        ));
+         window
+             .update(cx, |_, _, cx| {
+                 editor.update(cx, |editor, cx| {
+@@ -4646,9 +4683,259 @@ mod tests {
          })
      }
  
@@ -528,7 +818,7 @@ index 2bce5d0..e106b12 100644
 +        // number of a scratch buffer must stay allocated as long as it's shown in *any*
 +        // pane, and only be released once the last such pane closes it.
 +        let app_state = init_test(cx);
-+        enable_scratch_buffers(cx);
++        let _scratch_buffers_lock = enable_scratch_buffers(cx);
 +        let project = Project::test(app_state.fs.clone(), [], cx).await;
 +        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
 +        let workspace = window
@@ -657,18 +947,136 @@ index 2bce5d0..e106b12 100644
 +        );
 +    }
 +
++    #[gpui::test]
++    async fn test_reopened_scratch_buffer_reserves_its_number(cx: &mut TestAppContext) {
++        // docs/design.md 確定事項2・6: scratch バッファは Hot Exit の復元対象になる
++        // ため（削除しない）、それが実際に復元された時点でも番号がプロセス内の
++        // 管理状態に登録され、その番号を使う新規下書きと重複しないことを検証する。
++        // ここでは SerializableItem::deserialize の abs_path 分岐が最終的に通るのと
++        // 同じ経路（project.open_local_buffer -> Editor::for_buffer）で再現する。
++        let app_state = init_test(cx);
++        let _scratch_buffers_lock = enable_scratch_buffers(cx);
++        let project = Project::test(app_state.fs.clone(), [], cx).await;
++        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
++        let workspace = window
++            .read_with(cx, |mw, _| mw.workspace().clone())
++            .unwrap();
++
++        cx.dispatch_action(window.into(), NewFile);
++        let editor = cx.read(|cx| {
++            workspace
++                .read(cx)
++                .active_item(cx)
++                .unwrap()
++                .downcast::<Editor>()
++                .unwrap()
++        });
++        let (scratch_path, number) = cx.read(|cx| {
++            let buffer = editor.read(cx).buffer().read(cx).as_singleton().unwrap();
++            let file = buffer.read(cx).file().unwrap();
++            let abs_path = project::File::from_dyn(Some(file)).unwrap().abs_path(cx);
++            let number = workspace::scratch_buffers::scratch_display_number(&abs_path)
++                .expect("new scratch buffer must have a display number");
++            (abs_path, number)
++        });
++
++        // Close the tab and let it fully release (mirrors the previous test's
++        // cleanup sequence: serialization throttle, then one more effect flush).
++        let pane = cx.read(|cx| workspace.read(cx).active_pane().clone());
++        drop(editor);
++        window
++            .update(cx, |_, window, cx| {
++                pane.update(cx, |pane, cx| {
++                    pane.close_active_item(&workspace::pane::CloseActiveItem::default(), window, cx)
++                })
++            })
++            .unwrap()
++            .await
++            .unwrap();
++        cx.run_until_parked();
++        cx.executor().advance_clock(SERIALIZATION_THROTTLE_TIME);
++        cx.run_until_parked();
++        cx.update(|_| {});
++        cx.run_until_parked();
++        assert!(
++            !workspace::scratch_buffers::is_display_number_in_use(number),
++            "closing the only pane showing the scratch buffer must release its number"
++        );
++
++        // The file itself is still on disk (nothing deletes it): reopen it exactly
++        // like Hot Exit restoration would, without going through NewFile.
++        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
++        let reopened_buffer = project
++            .update(cx, |project, cx| {
++                project.open_local_buffer(scratch_path.clone(), cx)
++            })
++            .await
++            .unwrap();
++        window
++            .update(cx, |_, window, cx| {
++                let reopened_editor = cx.new(|cx| {
++                    Editor::for_buffer(reopened_buffer, Some(project.clone()), window, cx)
++                });
++                workspace.update(cx, |workspace, cx| {
++                    workspace.add_item_to_active_pane(
++                        Box::new(reopened_editor),
++                        None,
++                        true,
++                        window,
++                        cx,
++                    );
++                });
++            })
++            .unwrap();
++        cx.run_until_parked();
++
++        assert!(
++            workspace::scratch_buffers::is_display_number_in_use(number),
++            "reopening the existing scratch file must reserve its embedded number"
++        );
++
++        // A brand-new draft created while the reopened one is still around must not
++        // collide with it.
++        cx.dispatch_action(window.into(), NewFile);
++        let new_editor = cx.read(|cx| {
++            workspace
++                .read(cx)
++                .active_item(cx)
++                .unwrap()
++                .downcast::<Editor>()
++                .unwrap()
++        });
++        let new_number = cx.read(|cx| {
++            let buffer = new_editor.read(cx).buffer().read(cx).as_singleton().unwrap();
++            let file = buffer.read(cx).file().unwrap();
++            let abs_path = project::File::from_dyn(Some(file)).unwrap().abs_path(cx);
++            workspace::scratch_buffers::scratch_display_number(&abs_path)
++                .expect("new scratch buffer must have a display number")
++        });
++        assert_ne!(
++            new_number, number,
++            "the reopened scratch buffer's number must not be reused while it's still open"
++        );
++    }
++
      #[gpui::test]
      async fn test_setting_language_when_saving_as_single_file_worktree(cx: &mut TestAppContext) {
          let app_state = init_test(cx);
-+        enable_scratch_buffers(cx);
++        let _scratch_buffers_lock = enable_scratch_buffers(cx);
          app_state.fs.create_dir(Path::new("/root")).await.unwrap();
  
          let project = Project::test(app_state.fs.clone(), [], cx).await;
-@@ -6144,6 +6304,16 @@ mod tests {
+@@ -6144,6 +6431,23 @@ mod tests {
          });
      }
  
-+    fn enable_scratch_buffers(cx: &mut TestAppContext) {
++    /// scratch buffers を有効化し、番号がプロセスグローバルな状態である都合上、
++    /// 番号の割り当て・解放を検証する他のテストと並列実行されないようにする
++    /// ロックを返す。呼び出し元はこれをテストの終わりまで束縛したままにすること
++    /// （`let _guard = enable_scratch_buffers(cx);`）。
++    #[must_use]
++    fn enable_scratch_buffers(cx: &mut TestAppContext) -> std::sync::MutexGuard<'static, ()> {
++        let guard = workspace::scratch_buffers::test_synchronization_lock();
 +        cx.update(|cx| {
 +            cx.update_global::<SettingsStore, _>(|store, cx| {
 +                store.update_user_settings(cx, |settings| {
@@ -676,6 +1084,7 @@ index 2bce5d0..e106b12 100644
 +                });
 +            });
 +        });
++        guard
 +    }
 +
      fn init_test_with_state(

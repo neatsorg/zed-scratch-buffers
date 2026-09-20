@@ -4,8 +4,12 @@ Zed 本体（Rust/GPUI）向けの独立パッチ。一度も保存していな�
 （`Untitled-1` 相当）を、内部的には永続データ領域の `.txt` として管理し、
 通常の LSP（校正・変換・翻訳など）を利用できるようにする。
 
-表示上はタブ名に `.txt` を出さず、`Untitled-1` / 日本語化時は「無題-1」のまま扱う。
-機能は既定オフで、通常の Zed 単体でも有効化できる。
+表示上はタブ名に `.txt` を出さず、`Untitled-1` のまま扱う。機能は既定オフで、
+通常の Zed 単体でも有効化できる。
+
+このパッチ自体は英語固定で成立させる（`docs/repository-separation-plan.md` の
+合意事項）。日本語化時の「無題-1」表示は、i18n 側（zed-personal-build 統合時）の
+翻訳接続で対応する統合検証項目であり、このパッチのスコープには含まない。
 
 設計・要件は [`docs/design.md`](docs/design.md)、調査の背景は
 [`../zed-writing-tools/docs/scratch-buffer-research.md`](../zed-writing-tools/docs/scratch-buffer-research.md)
