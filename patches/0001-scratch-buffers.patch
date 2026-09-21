@@ -728,6 +728,40 @@ index 70cf387..5466b37 100644
              let Some(project_path) = project.project_path_for_absolute_path(abs_path, cx) else {
                  continue;
              };
+@@ -3109,14 +3123,20 @@
+         if self.restoring_workspace {
+             return false;
+         }
++        let history_len = self.persisted_recent_navigation_history.len();
++        self.persisted_recent_navigation_history
++            .retain(|path| !scratch_buffers::is_scratch_path(path));
++        let mut changed = self.persisted_recent_navigation_history.len() != history_len;
+         let Some(absolute_path) = self.project.read(cx).absolute_path(project_path, cx) else {
+-            return false;
++            return changed;
+         };
+-
+         self.last_active_project_path = Some(project_path.clone());
++        if scratch_buffers::is_scratch_path(&absolute_path) {
++            return changed;
++        }
+ 
+         if self.persisted_recent_navigation_history.first() == Some(&absolute_path) {
+-            return false;
++            return changed;
+         }
+ 
+         self.persisted_recent_navigation_history
+@@ -3125,7 +3146,8 @@
+         self.persisted_recent_navigation_history
+             .truncate(MAX_RECENT_SELECTIONS);
+-        true
++        changed = true;
++        changed
+     }
+ 
+     fn navigate_history(
+         &mut self,
 diff --git a/crates/workspace/src/workspace_settings.rs b/crates/workspace/src/workspace_settings.rs
 index eff3a0a..19b8367 100644
 --- a/crates/workspace/src/workspace_settings.rs
