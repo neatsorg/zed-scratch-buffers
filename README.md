@@ -1,23 +1,18 @@
 # zed-scratch-buffers
 
 Zed 本体（Rust/GPUI）向けの独立パッチ。一度も保存していない新規タブ
-（`Untitled-1` 相当）を、内部的には永続データ領域の `.txt` として管理し、
-通常の LSP（[校正・変換・翻訳](https://github.com/neatsorg/zed-writing-tools/tree/main)など）を利用できるようにする。
+（`Untitled-1` 相当）を、内部的には永続データ領域の `.txt` として管理する。
+表示上はタブ名に `.txt` を出さず、`Untitled-1` のまま扱いつつ、
+プレーンテキストに対応した LSP（[校正・変換・翻訳](https://github.com/neatsorg/zed-writing-tools/tree/main)など）を利用できるようにする。
 
-表示上はタブ名に `.txt` を出さず、`Untitled-1` のまま扱う。機能は既定オフで、
-通常の Zed 単体でも有効化できる。
+キャッシュ用フォルダには`buffer.txt`が複数保存されるが、
+「最近使ったファイル」などとしてZed 上で扱われないようにされています。
 
-現在、利用者が注意すべき副作用として、キャッシュフォルダに複数保存される`buffer.txt`が、
-最近保存されたファイルとしてZed 上で扱われるようになっています。
-`Ctrl+P`でファイルを開く際などは邪魔に感じるかもしれません。
-現状より実害が大きく見えはじめたら何らかの対応をする可能性があります。
+機能は既定オフで、パッチ適用後に `settings.json` に記述すると動作する。
 
 このパッチ自体は英語固定で成立させる（`docs/repository-separation-plan.md` の
 合意事項）。日本語化時の「無題-1」表示は、i18n 側（zed-personal-build 統合時）の
 翻訳接続で対応する統合検証項目であり、このパッチのスコープには含まない。
-
-設計・要件は [`docs/design.md`](docs/design.md)、検証結果は
-[`docs/verification.md`](docs/verification.md) を参照。
 
 ## 構成
 
@@ -31,9 +26,11 @@ docs/design.md         # 設計方針・確定した詳細
 docs/verification.md   # 検証記録
 ```
 
-`scripts/prepare` / `scripts/check` は `zed-word-counter` と同じパターンを踏襲する。
+設計・要件は [`docs/design.md`](docs/design.md)、検証結果は
+[`docs/verification.md`](docs/verification.md) を参照。
+`scripts/prepare` / `scripts/check` は拙作 [zed-word-counter](https://github.com/neatsorg/zed-word-counter) と同じパターンを踏襲する。
 
-## 必要な環境
+## ビルドに必要な環境
 
 - Git（対象コミットの取得に使用）
 - Rust toolchain（`rustup` 推奨。対象Zedの `rust-toolchain.toml` に従って切り替えます）
@@ -44,12 +41,12 @@ docs/verification.md   # 検証記録
 このリポジトリのパッチを適用します。Zedのプラットフォーム別ビルド要件は、使用するZedの
 上流ドキュメントも確認してください。
 
-## 設定
+## 実用上の設定
 
 `settings.json` の `scratch_buffers_enabled`（既定 `false`）で有効化する。
 `WorkspaceSettingsContent` は `SettingsContent` に `#[serde(flatten)]` で
 組み込まれているため、`"workspace": { ... }` のようにネストせず、
-トップレベル直下に書く。
+トップレベル直下に書いてください。
 
 ```json
 {
@@ -62,7 +59,8 @@ docs/verification.md   # 検証記録
 パッチ本体（第一版）を実装し、`editor`・`workspace` クレート単体のテスト、
 `zed` クレートでの統合テスト（新規タブ作成・LSP登録・保存フロー・分割ペインでの
 番号解放）で検証済み。詳細は [`docs/verification.md`](docs/verification.md) を参照。
-`zed-personal-build` 側での統合ビルド・GUI確認は未実施。
+その後、実機テストを経てremember_navigation_history_path (crates/workspace/src/workspace.rs:3122) にキャッシュが漏れることを
+確認し、これを除去する処理を追加した。
 
 ## ライセンスと公開範囲
 
