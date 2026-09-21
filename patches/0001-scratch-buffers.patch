@@ -701,6 +701,33 @@ index 70cf387..5466b37 100644
  pub mod searchable;
  pub mod security_modal;
  pub mod shared_screen;
+@@ -3031,6 +3032,16 @@
+             .map(|(project_path, (fs_path, _))| (project_path, fs_path))
+             .rev()
+             .filter(move |(history_path, abs_path)| {
++                // Scratch buffers use real internal files so they can register with LSP, but
++                // those files are not user files and should not appear in recent-file history
++                // (including the Ctrl+P file finder).
++                if abs_path
++                    .as_ref()
++                    .is_some_and(|abs_path| scratch_buffers::is_scratch_path(abs_path))
++                {
++                    return false;
++                }
++
+                 let latest_project_path_opened = abs_path
+                     .as_ref()
+                     .and_then(|abs_path| abs_paths_opened.get(abs_path))
+@@ -3050,6 +3061,9 @@
+             .collect::<HashSet<_>>();
+         let project = self.project.read(cx);
+         for abs_path in &self.persisted_recent_navigation_history {
++            if scratch_buffers::is_scratch_path(abs_path) {
++                continue;
++            }
+             let Some(project_path) = project.project_path_for_absolute_path(abs_path, cx) else {
+                 continue;
+             };
 diff --git a/crates/workspace/src/workspace_settings.rs b/crates/workspace/src/workspace_settings.rs
 index eff3a0a..19b8367 100644
 --- a/crates/workspace/src/workspace_settings.rs
