@@ -59,7 +59,7 @@ docs/verification.md   # 検証記録
 パッチ本体（第一版）を実装し、`editor`・`workspace` クレート単体のテスト、
 `zed` クレートでの統合テスト（新規タブ作成・LSP登録・保存フロー・分割ペインでの
 番号解放）で検証済み。詳細は [`docs/verification.md`](docs/verification.md) を参照。
-その後、実機テストを経てremember_navigation_history_path (crates/workspace/src/workspace.rs:3122) にキャッシュが漏れることを
+その後、実機テストを経てremember_navigation_history_pathにキャッシュファイル情報が漏れることを
 確認し、これを除去する処理を追加した。
 
 ## ライセンスと公開範囲
