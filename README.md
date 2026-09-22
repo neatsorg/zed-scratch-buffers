@@ -30,6 +30,9 @@ docs/verification.md   # 検証記録
 [`docs/verification.md`](docs/verification.md) を参照。
 `scripts/prepare` / `scripts/check` は拙作 [zed-word-counter](https://github.com/neatsorg/zed-word-counter) と同じパターンを踏襲する。
 
+現在の固定値（2026-09-20時点）: Zed `v1.20.2` @ [`7c451e6`](https://github.com/zed-industries/zed/commit/7c451e694f3c52ee0aeb01d7e28b5fa18cd0ad2f)（正本は `upstream.toml`）。
+`scripts/prepare` 実行後、`.checkout/zed` で `git log -1` すれば同じコミットであることを確認できる。
+
 ## ビルドに必要な環境
 
 - Git（対象コミットの取得に使用）
