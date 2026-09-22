@@ -778,7 +778,7 @@ index eff3a0a..19b8367 100644
              pane_split_direction_vertical: workspace.pane_split_direction_vertical.unwrap(),
              centered_layout: workspace.centered_layout.unwrap(),
              confirm_quit: workspace.confirm_quit.unwrap(),
-+            scratch_buffers_enabled: workspace.scratch_buffers_enabled.unwrap(),
++            scratch_buffers_enabled: workspace.scratch_buffers_enabled.unwrap_or(false),
              show_call_status_icon: workspace.show_call_status_icon.unwrap(),
              autosave: workspace.autosave.unwrap(),
              restore_on_startup: workspace.restore_on_startup.unwrap(),
