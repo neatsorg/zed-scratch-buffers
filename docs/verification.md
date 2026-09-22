@@ -302,3 +302,60 @@ editor 1011件・workspace 274件・zed --bin zed 95件（新規1件含む、3�
 対象テストは一度も失敗せず、既存の無関係な flaky テストのみ発生）すべて成功。
 パッチを再生成し、クリーンな `7c451e694f3c52ee0aeb01d7e28b5fa18cd0ad2f` への
 単独適用・`scripts/check` の成功を再確認した。
+
+## 2026-09-21: 最近使ったファイル履歴からの scratch buffer 除外
+
+README に既知の副作用として記録していた、キャッシュ領域の `buffer.txt` が Zed の
+「最近使ったファイル」（`Ctrl+P` のファイルピッカー含む）に紛れ込む問題に対処した。
+
+### 1. 表示側のフィルタ（`9c72787` Hide scratch buffers from recent file history）
+
+`Workspace::recent_navigation_history_iter`（`crates/workspace/src/workspace.rs`）内の
+2箇所——各ペインの `nav_history` を辿るフィルタ、および
+`persisted_recent_navigation_history` を読み戻すループ——のそれぞれに
+`scratch_buffers::is_scratch_path` によるフィルタを追加し、scratch buffer のパスが
+最近使ったファイル一覧に出ないようにした。
+
+### 2. レビューで判明した書き込み側の漏れ（`fb8054c` Avoid persisting scratch buffers in navigation history）
+
+表示側のみのフィルタでは不十分だった。`remember_navigation_history_path`
+（同ファイル）は新規タブ作成時にも呼ばれ、scratch buffer の絶対パスを無条件で
+`persisted_recent_navigation_history`（上限 `MAX_RECENT_SELECTIONS` = 20件、
+`serialize_workspace` でディスクに永続化）の先頭へ挿入していた。scratch タブを
+開くたびに、表示されない scratch エントリが本物の最近使ったファイルを1件ずつ
+リストから追い出し、DB にも書き込まれ続けていることをコードで確認した。
+
+対処:
+- `remember_navigation_history_path` の先頭で `persisted_recent_navigation_history`
+  から既存の scratch エントリを `retain` で除去する（過去のセッションで
+  紛れ込んだ分も、この関数が次に呼ばれたときに遡って掃除される）。
+- 新しい `absolute_path` が scratch パスであれば、リストに追加せず早期 return する。
+
+レビューで追加で指摘された2点:
+1. 早期 return 時に `last_active_project_path` を更新していなかったため、scratch
+   タブにフォーカスしている間 `active_item_path_changed` の
+   `active_project_path_changed` 判定が毎回 `true` になり、フォーカス変更のたびに
+   上記の `retain` スキャンが再実行されてしまう（リストは20件上限なので実害は
+   ほぼ無いが無駄がある）→ `last_active_project_path` の設定を scratch 判定より
+   前に移動して解消した。
+2. この write 側の挙動（scratch パスが `persisted_recent_navigation_history` に
+   載らないこと・既存の scratch エントリが掃除されること）を直接検証する専用の
+   単体テストが無い → 今回は見送り、既存テストで regression が無いことのみ確認。
+
+### 検証
+
+- `scripts/check`（`cargo check` / `cargo test --lib` を `editor`・`workspace`
+  両クレートに対して実行）: editor 1011件・workspace 274件、いずれも成功
+  （regression なし）。
+- 既存の関連テスト（`test_navigation_history_deduplication`、
+  `test_clear_navigation_history_clears_persisted_recent_paths`、
+  `test_recent_navigation_history_includes_persisted_paths`、
+  `test_persisted_recent_navigation_history_is_bounded_mru`、
+  `test_project_rename_updates_persisted_navigation_history`、
+  `test_most_recent_active_path_skips_read_only_paths`）はいずれも pass。
+
+### 未実施（次フェーズ）
+
+- scratch buffer 生成時に `persisted_recent_navigation_history` へ載らないこと・
+  既存の scratch エントリが掃除されることを直接検証する専用テストの追加。
+- `zed-personal-build` 側での統合ビルド・GUI 起動確認は本ラウンドでも未実施。
